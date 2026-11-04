@@ -1,18 +1,52 @@
 -- ==============================================================================
--- KOST SYSTEM DATABASE SCHEMA (SUPABASE / POSTGRESQL)
+-- KOST SYSTEM DATABASE SCHEMA (SUPABASE / POSTGRESQL) - MIDTRANS READY
 -- ==============================================================================
 
 -- 1. Enable UUID Extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- 2. ENUM TYPES
-CREATE TYPE user_role AS ENUM ('owner', 'manager', 'tenant');
-CREATE TYPE room_status AS ENUM ('available', 'occupied', 'maintenance');
-CREATE TYPE tenant_status AS ENUM ('active', 'inactive');
-CREATE TYPE invoice_status AS ENUM ('unpaid', 'pending_verification', 'paid', 'overdue', 'rejected');
-CREATE TYPE payment_method AS ENUM ('bank_transfer', 'qris');
-CREATE TYPE verification_status AS ENUM ('pending', 'verified', 'rejected');
-CREATE TYPE expense_category AS ENUM ('maintenance', 'utilities', 'cleaning', 'security', 'operational');
+DO $$ BEGIN
+    CREATE TYPE user_role AS ENUM ('owner', 'manager', 'tenant');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE room_status AS ENUM ('available', 'occupied', 'maintenance');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE tenant_status AS ENUM ('active', 'inactive');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE invoice_status AS ENUM ('unpaid', 'pending_verification', 'paid', 'overdue', 'rejected', 'expired');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE payment_method AS ENUM ('bank_transfer', 'qris', 'midtrans_va', 'midtrans_qris', 'midtrans_ewallet', 'cash');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE verification_status AS ENUM ('pending', 'verified', 'rejected', 'settlement', 'expire', 'deny', 'cancel');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE expense_category AS ENUM ('maintenance', 'utilities', 'cleaning', 'security', 'operational');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
 
 -- 3. USERS TABLE
 CREATE TABLE IF NOT EXISTS users (
@@ -56,14 +90,18 @@ CREATE TABLE IF NOT EXISTS tenants (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Add foreign keys for references between users, rooms, and tenants
-ALTER TABLE users 
-    ADD CONSTRAINT fk_user_tenant 
-    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE SET NULL;
+-- Foreign keys
+DO $$ BEGIN
+    ALTER TABLE users ADD CONSTRAINT fk_user_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE SET NULL;
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
 
-ALTER TABLE rooms 
-    ADD CONSTRAINT fk_room_tenant 
-    FOREIGN KEY (current_tenant_id) REFERENCES tenants(id) ON DELETE SET NULL;
+DO $$ BEGIN
+    ALTER TABLE rooms ADD CONSTRAINT fk_room_tenant FOREIGN KEY (current_tenant_id) REFERENCES tenants(id) ON DELETE SET NULL;
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
 
 -- 6. INVOICES TABLE
 CREATE TABLE IF NOT EXISTS invoices (
@@ -76,13 +114,15 @@ CREATE TABLE IF NOT EXISTS invoices (
     due_date DATE NOT NULL,
     status invoice_status NOT NULL DEFAULT 'unpaid',
     latest_submission_id UUID,
+    snap_token VARCHAR(255),
+    snap_redirect_url TEXT,
     paid_at TIMESTAMPTZ,
     notes TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 7. PAYMENT SUBMISSIONS TABLE
+-- 7. PAYMENT SUBMISSIONS / TRANSACTIONS TABLE (MIDTRANS IDEMPOTENCY READY)
 CREATE TABLE IF NOT EXISTS payment_submissions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     invoice_id UUID NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
@@ -90,22 +130,28 @@ CREATE TABLE IF NOT EXISTS payment_submissions (
     amount NUMERIC(12, 2) NOT NULL,
     payment_date DATE NOT NULL DEFAULT CURRENT_DATE,
     method payment_method NOT NULL DEFAULT 'bank_transfer',
+    payment_gateway VARCHAR(50) NOT NULL DEFAULT 'manual', -- 'manual' | 'midtrans'
+    midtrans_transaction_id VARCHAR(255) UNIQUE, -- Idempotency key: prevents duplicate transaction processing
+    midtrans_order_id VARCHAR(255),
+    midtrans_payment_type VARCHAR(100),
     sender_bank VARCHAR(100),
     sender_name VARCHAR(255),
-    proof_image_url TEXT NOT NULL,
+    proof_image_url TEXT, -- NULLABLE for automated payment gateways
     status verification_status NOT NULL DEFAULT 'pending',
     reviewed_by VARCHAR(255),
     reviewed_at TIMESTAMPTZ,
     rejection_reason TEXT,
+    raw_response JSONB, -- Stores webhook payload for audit and dispute tracing
     notes TEXT,
     submitted_at TIMESTAMPTZ DEFAULT NOW(),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Add foreign key from invoices to latest submission
-ALTER TABLE invoices
-    ADD CONSTRAINT fk_invoice_latest_submission
-    FOREIGN KEY (latest_submission_id) REFERENCES payment_submissions(id) ON DELETE SET NULL;
+DO $$ BEGIN
+    ALTER TABLE invoices ADD CONSTRAINT fk_invoice_latest_submission FOREIGN KEY (latest_submission_id) REFERENCES payment_submissions(id) ON DELETE SET NULL;
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
 
 -- 8. EXPENSES TABLE
 CREATE TABLE IF NOT EXISTS expenses (
@@ -120,7 +166,7 @@ CREATE TABLE IF NOT EXISTS expenses (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 9. SETTINGS TABLE (Single-row configuration)
+-- 9. SETTINGS TABLE
 CREATE TABLE IF NOT EXISTS settings (
     id INT PRIMARY KEY DEFAULT 1,
     kost_name VARCHAR(255) NOT NULL DEFAULT 'KostFlow Residence',
@@ -134,13 +180,16 @@ CREATE TABLE IF NOT EXISTS settings (
     qris_nmid VARCHAR(100) DEFAULT '',
     qris_merchant_name VARCHAR(255) DEFAULT '',
     qris_image_url TEXT DEFAULT '',
+    midtrans_server_key TEXT DEFAULT '',
+    midtrans_client_key TEXT DEFAULT '',
+    midtrans_is_production BOOLEAN DEFAULT false,
     default_due_day INT DEFAULT 10,
     payment_instructions TEXT DEFAULT '',
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     CONSTRAINT single_row_check CHECK (id = 1)
 );
 
--- 10. INDEXES FOR PERFORMANCE
+-- 10. INDEXES
 CREATE INDEX IF NOT EXISTS idx_rooms_status ON rooms(status);
 CREATE INDEX IF NOT EXISTS idx_tenants_status ON tenants(status);
 CREATE INDEX IF NOT EXISTS idx_tenants_room_id ON tenants(room_id);
@@ -148,10 +197,11 @@ CREATE INDEX IF NOT EXISTS idx_invoices_period_month ON invoices(period_month);
 CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
 CREATE INDEX IF NOT EXISTS idx_invoices_tenant_id ON invoices(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_submissions_invoice_id ON payment_submissions(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_submissions_midtrans_id ON payment_submissions(midtrans_transaction_id);
 CREATE INDEX IF NOT EXISTS idx_submissions_status ON payment_submissions(status);
 CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
 
--- 11. ENABLE ROW LEVEL SECURITY (RLS)
+-- 11. ROW LEVEL SECURITY
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE rooms ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
@@ -160,13 +210,57 @@ ALTER TABLE payment_submissions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE expenses ENABLE ROW LEVEL SECURITY;
 ALTER TABLE settings ENABLE ROW LEVEL SECURITY;
 
--- 12. DEFAULT PUBLIC READ POLICY FOR LANDING PAGE (ROOMS & SETTINGS)
-CREATE POLICY "Public read rooms" ON rooms FOR SELECT USING (true);
-CREATE POLICY "Public read settings" ON settings FOR SELECT USING (true);
-CREATE POLICY "Service role full access users" ON users FOR ALL USING (true);
-CREATE POLICY "Service role full access rooms" ON rooms FOR ALL USING (true);
-CREATE POLICY "Service role full access tenants" ON tenants FOR ALL USING (true);
-CREATE POLICY "Service role full access invoices" ON invoices FOR ALL USING (true);
-CREATE POLICY "Service role full access submissions" ON payment_submissions FOR ALL USING (true);
-CREATE POLICY "Service role full access expenses" ON expenses FOR ALL USING (true);
-CREATE POLICY "Service role full access settings" ON settings FOR ALL USING (true);
+-- 12. RLS POLICIES
+DO $$ BEGIN
+    CREATE POLICY "Public read rooms" ON rooms FOR SELECT USING (true);
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "Public read settings" ON settings FOR SELECT USING (true);
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "Service role full access users" ON users FOR ALL USING (true);
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "Service role full access rooms" ON rooms FOR ALL USING (true);
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "Service role full access tenants" ON tenants FOR ALL USING (true);
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "Service role full access invoices" ON invoices FOR ALL USING (true);
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "Service role full access submissions" ON payment_submissions FOR ALL USING (true);
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "Service role full access expenses" ON expenses FOR ALL USING (true);
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "Service role full access settings" ON settings FOR ALL USING (true);
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
