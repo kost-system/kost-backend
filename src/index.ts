@@ -154,6 +154,58 @@ app.get('/api/bootstrap', async (_req: Request, res: Response) => {
   }
 });
 
+// SETTINGS (GET & PUT)
+app.get('/api/settings', async (_req: Request, res: Response) => {
+  if (!supabase) return res.status(500).json({ error: 'Database offline' });
+  const { data, error } = await supabase.from('settings').select('*').limit(1).maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data) return res.json(null);
+  res.json({
+    kostName: data.kost_name,
+    tagline: data.tagline,
+    address: data.address,
+    phone: data.phone,
+    email: data.email,
+    bankName: data.bank_name,
+    bankAccountNumber: data.bank_account_number,
+    bankAccountName: data.bank_account_name,
+    qrisNmid: data.qris_nmid,
+    qrisMerchantName: data.qris_merchant_name,
+    qrisImageUrl: data.qris_image_url,
+    defaultDueDay: data.default_due_day,
+    paymentInstructions: data.payment_instructions,
+  });
+});
+
+app.put('/api/settings', async (req: Request, res: Response) => {
+  if (!supabase) return res.status(500).json({ error: 'Database offline' });
+  const b = req.body;
+  const updates: any = { id: 1 };
+  if (b.kostName !== undefined) updates.kost_name = b.kostName;
+  if (b.tagline !== undefined) updates.tagline = b.tagline;
+  if (b.address !== undefined) updates.address = b.address;
+  if (b.phone !== undefined) updates.phone = b.phone;
+  if (b.email !== undefined) updates.email = b.email;
+  if (b.bankName !== undefined) updates.bank_name = b.bankName;
+  if (b.bankAccountNumber !== undefined) updates.bank_account_number = b.bankAccountNumber;
+  if (b.bankAccountName !== undefined) updates.bank_account_name = b.bankAccountName;
+  if (b.qrisNmid !== undefined) updates.qris_nmid = b.qrisNmid;
+  if (b.qrisMerchantName !== undefined) updates.qris_merchant_name = b.qrisMerchantName;
+  if (b.qrisImageUrl !== undefined) updates.qris_image_url = b.qrisImageUrl;
+  if (b.defaultDueDay !== undefined) updates.default_due_day = Number(b.defaultDueDay);
+  if (b.paymentInstructions !== undefined) updates.payment_instructions = b.paymentInstructions;
+  updates.updated_at = new Date().toISOString();
+
+  const { data, error } = await supabase
+    .from('settings')
+    .upsert([updates], { onConflict: 'id' })
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
 // Rooms
 app.get('/api/rooms', async (_req: Request, res: Response) => {
   if (!supabase) return res.json([]);
@@ -222,7 +274,7 @@ app.delete('/api/rooms/:id', async (req: Request, res: Response) => {
   res.json({ success: true });
 });
 
-// Tenants
+// Tenants (GET, POST, PUT, DELETE, CHECKOUT)
 app.get('/api/tenants', async (_req: Request, res: Response) => {
   if (!supabase) return res.json([]);
   const { data, error } = await supabase.from('tenants').select('*').order('created_at', { ascending: false });
@@ -268,6 +320,56 @@ app.post('/api/tenants', async (req: Request, res: Response) => {
   }
 
   res.status(201).json(data);
+});
+
+app.put('/api/tenants/:id', async (req: Request, res: Response) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase not connected' });
+  const b = req.body;
+  const updates: any = {};
+  if (b.name !== undefined) updates.name = b.name;
+  if (b.phone !== undefined) updates.phone = b.phone;
+  if (b.email !== undefined) updates.email = b.email;
+  if (b.roomId !== undefined) updates.room_id = b.roomId || null;
+  if (b.startDate !== undefined) updates.start_date = b.startDate;
+  if (b.status !== undefined) updates.status = b.status;
+  if (b.emergencyContact !== undefined) updates.emergency_contact = b.emergencyContact;
+  if (b.notes !== undefined) updates.notes = b.notes;
+  updates.updated_at = new Date().toISOString();
+
+  // Check if room changed
+  const { data: currentTenant } = await supabase.from('tenants').select('room_id').eq('id', req.params.id).single();
+
+  const { data, error } = await supabase
+    .from('tenants')
+    .update(updates)
+    .eq('id', req.params.id)
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Update room occupancy if room changed
+  if (b.roomId !== undefined && currentTenant && currentTenant.room_id !== b.roomId) {
+    if (currentTenant.room_id) {
+      await supabase.from('rooms').update({ status: 'available', current_tenant_id: null }).eq('id', currentTenant.room_id);
+    }
+    if (b.roomId) {
+      await supabase.from('rooms').update({ status: 'occupied', current_tenant_id: req.params.id }).eq('id', b.roomId);
+    }
+  }
+
+  res.json(data);
+});
+
+app.delete('/api/tenants/:id', async (req: Request, res: Response) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase not connected' });
+  const { data: tenant } = await supabase.from('tenants').select('room_id').eq('id', req.params.id).single();
+  if (tenant && tenant.room_id) {
+    await supabase.from('rooms').update({ status: 'available', current_tenant_id: null }).eq('id', tenant.room_id);
+  }
+  const { error } = await supabase.from('tenants').delete().eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
 });
 
 app.post('/api/tenants/:id/checkout', async (req: Request, res: Response) => {
@@ -320,13 +422,30 @@ app.post('/api/invoices', async (req: Request, res: Response) => {
   res.status(201).json(data);
 });
 
+app.put('/api/invoices/:id', async (req: Request, res: Response) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase not connected' });
+  const { data, error } = await supabase
+    .from('invoices')
+    .update(req.body)
+    .eq('id', req.params.id)
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.delete('/api/invoices/:id', async (req: Request, res: Response) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase not connected' });
+  const { error } = await supabase.from('invoices').delete().eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
 // ==============================================================================
 // MIDTRANS INTEGRATION ENDPOINTS
 // ==============================================================================
 
-/**
- * 1. CREATE SNAP TRANSACTION (Minta Token Bayar dari Midtrans)
- */
 app.post('/api/payments/midtrans/create-snap', async (req: Request, res: Response) => {
   if (!isMidtransConfigured || !snap) {
     return res.status(503).json({
@@ -339,7 +458,6 @@ app.post('/api/payments/midtrans/create-snap', async (req: Request, res: Respons
   if (!invoiceId) return res.status(400).json({ error: 'invoiceId is required' });
 
   try {
-    // Ambil data invoice & tenant
     const { data: invoice, error: invErr } = await supabase
       .from('invoices')
       .select('*, tenants(name, email, phone), rooms(number)')
@@ -376,7 +494,6 @@ app.post('/api/payments/midtrans/create-snap', async (req: Request, res: Respons
 
     const transaction = await snap.createTransaction(parameter);
 
-    // Simpan token ke invoice
     await supabase
       .from('invoices')
       .update({
@@ -395,9 +512,6 @@ app.post('/api/payments/midtrans/create-snap', async (req: Request, res: Respons
   }
 });
 
-/**
- * 2. WEBHOOK NOTIFICATION HANDLER (Menerima notifikasi otomatis dari Midtrans)
- */
 app.post('/api/payments/midtrans/notification', async (req: Request, res: Response) => {
   const notification = req.body;
   if (!supabase) return res.status(500).json({ error: 'Database offline' });
@@ -413,7 +527,6 @@ app.post('/api/payments/midtrans/notification', async (req: Request, res: Respon
     fraud_status,
   } = notification;
 
-  // 1. Verifikasi Signature Hash (Anti-Spoofing / Anti Fake Pilot)
   const isValid = verifyMidtransSignature(order_id, status_code, gross_amount, signature_key);
   if (!isValid) {
     console.warn(`🚨 Invalid Midtrans Signature for order: ${order_id}`);
@@ -421,7 +534,6 @@ app.post('/api/payments/midtrans/notification', async (req: Request, res: Respon
   }
 
   try {
-    // Cari invoice berdasarkan order_id (Format: INV-XXXX-RANDOM)
     const baseInvNumber = order_id.split('-').slice(0, 3).join('-');
     const { data: invoice } = await supabase
       .from('invoices')
@@ -434,31 +546,20 @@ app.post('/api/payments/midtrans/notification', async (req: Request, res: Respon
       return res.status(404).json({ error: 'Invoice not found' });
     }
 
-    // 2. Idempotency Check: Jika invoice sudah paid, respon 200 OK langsung
     if (invoice.status === 'paid') {
       return res.status(200).json({ message: 'Transaction already settled' });
     }
 
     let isSuccess = false;
-    let newStatus = 'pending';
 
     if (transaction_status === 'capture') {
       if (fraud_status === 'accept') {
         isSuccess = true;
-        newStatus = 'settlement';
       }
     } else if (transaction_status === 'settlement') {
       isSuccess = true;
-      newStatus = 'settlement';
-    } else if (
-      transaction_status === 'cancel' ||
-      transaction_status === 'deny' ||
-      transaction_status === 'expire'
-    ) {
-      newStatus = transaction_status;
     }
 
-    // 3. Catat payment_submission (Anti-Duplikat berkat UNIQUE midtrans_transaction_id)
     const { data: submission } = await supabase
       .from('payment_submissions')
       .upsert(
@@ -483,7 +584,6 @@ app.post('/api/payments/midtrans/notification', async (req: Request, res: Respon
       .select()
       .single();
 
-    // 4. Update status invoice jika sukses lunas
     if (isSuccess) {
       await supabase
         .from('invoices')
