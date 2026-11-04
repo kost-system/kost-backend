@@ -1,6 +1,7 @@
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import { supabase, isSupabaseConfigured } from './supabase.js';
+import { snap, isMidtransConfigured, verifyMidtransSignature } from './midtrans.js';
 import {
   Room,
   Tenant,
@@ -28,6 +29,7 @@ app.get('/api/health', async (_req: Request, res: Response) => {
     status: 'ok',
     service: 'kost_backend',
     database: dbStatus,
+    midtrans: isMidtransConfigured ? 'ready' : 'missing_keys',
     timestamp: new Date().toISOString(),
   });
 });
@@ -49,7 +51,6 @@ app.get('/api/bootstrap', async (_req: Request, res: Response) => {
       supabase.from('settings').select('*').limit(1).maybeSingle(),
     ]);
 
-    // Format snake_case to camelCase for rooms
     const rooms = (roomsRes.data || []).map((r: any) => ({
       id: r.id,
       number: r.number,
@@ -61,7 +62,6 @@ app.get('/api/bootstrap', async (_req: Request, res: Response) => {
       notes: r.notes,
     }));
 
-    // Format tenants
     const tenants = (tenantsRes.data || []).map((t: any) => ({
       id: t.id,
       name: t.name,
@@ -74,7 +74,6 @@ app.get('/api/bootstrap', async (_req: Request, res: Response) => {
       notes: t.notes,
     }));
 
-    // Format invoices
     const invoices = (invoicesRes.data || []).map((i: any) => ({
       id: i.id,
       invoiceNumber: i.invoice_number,
@@ -84,13 +83,14 @@ app.get('/api/bootstrap', async (_req: Request, res: Response) => {
       amount: Number(i.amount),
       dueDate: i.due_date,
       status: i.status,
+      snapToken: i.snap_token,
+      snapRedirectUrl: i.snap_redirect_url,
       createdAt: i.created_at,
       paidAt: i.paid_at,
       latestSubmissionId: i.latest_submission_id,
       notes: i.notes,
     }));
 
-    // Format submissions
     const submissions = (submissionsRes.data || []).map((s: any) => ({
       id: s.id,
       invoiceId: s.invoice_id,
@@ -109,7 +109,6 @@ app.get('/api/bootstrap', async (_req: Request, res: Response) => {
       notes: s.notes,
     }));
 
-    // Format expenses
     const expenses = (expensesRes.data || []).map((e: any) => ({
       id: e.id,
       description: e.description,
@@ -120,7 +119,6 @@ app.get('/api/bootstrap', async (_req: Request, res: Response) => {
       recordedBy: e.recorded_by,
     }));
 
-    // Format settings
     let settings = null;
     if (settingsRes.data) {
       const s = settingsRes.data;
@@ -322,6 +320,189 @@ app.post('/api/invoices', async (req: Request, res: Response) => {
   res.status(201).json(data);
 });
 
+// ==============================================================================
+// MIDTRANS INTEGRATION ENDPOINTS
+// ==============================================================================
+
+/**
+ * 1. CREATE SNAP TRANSACTION (Minta Token Bayar dari Midtrans)
+ */
+app.post('/api/payments/midtrans/create-snap', async (req: Request, res: Response) => {
+  if (!isMidtransConfigured || !snap) {
+    return res.status(503).json({
+      error: 'Midtrans belum dikonfigurasi. Periksa MIDTRANS_SERVER_KEY di .env',
+    });
+  }
+  if (!supabase) return res.status(500).json({ error: 'Supabase not connected' });
+
+  const { invoiceId } = req.body;
+  if (!invoiceId) return res.status(400).json({ error: 'invoiceId is required' });
+
+  try {
+    // Ambil data invoice & tenant
+    const { data: invoice, error: invErr } = await supabase
+      .from('invoices')
+      .select('*, tenants(name, email, phone), rooms(number)')
+      .eq('id', invoiceId)
+      .single();
+
+    if (invErr || !invoice) return res.status(404).json({ error: 'Invoice not found' });
+    if (invoice.status === 'paid') {
+      return res.status(400).json({ error: 'Tagihan sudah lunas' });
+    }
+
+    const tenant = invoice.tenants;
+    const room = invoice.rooms;
+
+    const parameter = {
+      transaction_details: {
+        order_id: `${invoice.invoice_number}-${Date.now().toString().slice(-4)}`,
+        gross_amount: Math.round(Number(invoice.amount)),
+      },
+      customer_details: {
+        first_name: tenant?.name || 'Penghuni',
+        email: tenant?.email || 'penghuni@kost.com',
+        phone: tenant?.phone || '08123456789',
+      },
+      item_details: [
+        {
+          id: invoice.id,
+          price: Math.round(Number(invoice.amount)),
+          quantity: 1,
+          name: `Sewa Kamar ${room?.number || ''} (${invoice.period_month})`,
+        },
+      ],
+    };
+
+    const transaction = await snap.createTransaction(parameter);
+
+    // Simpan token ke invoice
+    await supabase
+      .from('invoices')
+      .update({
+        snap_token: transaction.token,
+        snap_redirect_url: transaction.redirect_url,
+      })
+      .eq('id', invoiceId);
+
+    res.json({
+      token: transaction.token,
+      redirect_url: transaction.redirect_url,
+    });
+  } catch (err: any) {
+    console.error('Midtrans Snap Error:', err);
+    res.status(500).json({ error: err.message || 'Gagal membuat transaksi Midtrans' });
+  }
+});
+
+/**
+ * 2. WEBHOOK NOTIFICATION HANDLER (Menerima notifikasi otomatis dari Midtrans)
+ */
+app.post('/api/payments/midtrans/notification', async (req: Request, res: Response) => {
+  const notification = req.body;
+  if (!supabase) return res.status(500).json({ error: 'Database offline' });
+
+  const {
+    order_id,
+    status_code,
+    gross_amount,
+    signature_key,
+    transaction_status,
+    transaction_id,
+    payment_type,
+    fraud_status,
+  } = notification;
+
+  // 1. Verifikasi Signature Hash (Anti-Spoofing / Anti Fake Pilot)
+  const isValid = verifyMidtransSignature(order_id, status_code, gross_amount, signature_key);
+  if (!isValid) {
+    console.warn(`🚨 Invalid Midtrans Signature for order: ${order_id}`);
+    return res.status(403).json({ error: 'Invalid signature key' });
+  }
+
+  try {
+    // Cari invoice berdasarkan order_id (Format: INV-XXXX-RANDOM)
+    const baseInvNumber = order_id.split('-').slice(0, 3).join('-');
+    const { data: invoice } = await supabase
+      .from('invoices')
+      .select('*')
+      .or(`invoice_number.eq.${baseInvNumber},invoice_number.eq.${order_id}`)
+      .single();
+
+    if (!invoice) {
+      console.warn(`Invoice not found for order ${order_id}`);
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    // 2. Idempotency Check: Jika invoice sudah paid, respon 200 OK langsung
+    if (invoice.status === 'paid') {
+      return res.status(200).json({ message: 'Transaction already settled' });
+    }
+
+    let isSuccess = false;
+    let newStatus = 'pending';
+
+    if (transaction_status === 'capture') {
+      if (fraud_status === 'accept') {
+        isSuccess = true;
+        newStatus = 'settlement';
+      }
+    } else if (transaction_status === 'settlement') {
+      isSuccess = true;
+      newStatus = 'settlement';
+    } else if (
+      transaction_status === 'cancel' ||
+      transaction_status === 'deny' ||
+      transaction_status === 'expire'
+    ) {
+      newStatus = transaction_status;
+    }
+
+    // 3. Catat payment_submission (Anti-Duplikat berkat UNIQUE midtrans_transaction_id)
+    const { data: submission } = await supabase
+      .from('payment_submissions')
+      .upsert(
+        [
+          {
+            invoice_id: invoice.id,
+            tenant_id: invoice.tenant_id,
+            amount: Number(gross_amount),
+            payment_date: new Date().toISOString().split('T')[0],
+            method: payment_type === 'qris' ? 'midtrans_qris' : 'midtrans_va',
+            payment_gateway: 'midtrans',
+            midtrans_transaction_id: transaction_id,
+            midtrans_order_id: order_id,
+            midtrans_payment_type: payment_type,
+            status: isSuccess ? 'settlement' : 'pending',
+            raw_response: notification,
+            notes: `Midtrans payment via ${payment_type} (${transaction_status})`,
+          },
+        ],
+        { onConflict: 'midtrans_transaction_id' }
+      )
+      .select()
+      .single();
+
+    // 4. Update status invoice jika sukses lunas
+    if (isSuccess) {
+      await supabase
+        .from('invoices')
+        .update({
+          status: 'paid',
+          paid_at: new Date().toISOString(),
+          latest_submission_id: submission?.id || null,
+        })
+        .eq('id', invoice.id);
+      console.log(`✅ Invoice ${invoice.invoice_number} successfully paid via Midtrans!`);
+    }
+
+    res.status(200).json({ status: 'ok' });
+  } catch (err: any) {
+    console.error('Error handling Midtrans webhook:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Expenses
 app.get('/api/expenses', async (_req: Request, res: Response) => {
   if (!supabase) return res.json([]);
@@ -355,4 +536,5 @@ app.post('/api/expenses', async (req: Request, res: Response) => {
 app.listen(PORT, () => {
   console.log(`🚀 Kost Backend API running on http://localhost:${PORT}`);
   console.log(`📡 Database mode: ${isSupabaseConfigured ? 'Supabase Live' : 'Offline / Mock'}`);
+  console.log(`💳 Midtrans Gateway: ${isMidtransConfigured ? 'Configured & Active' : 'Waiting for Keys'}`);
 });
