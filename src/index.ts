@@ -454,57 +454,99 @@ app.post('/api/payments/midtrans/create-snap', async (req: Request, res: Respons
   }
   if (!supabase) return res.status(500).json({ error: 'Supabase not connected' });
 
-  const { invoiceId } = req.body;
-  if (!invoiceId) return res.status(400).json({ error: 'invoiceId is required' });
+  const { invoiceId, tenantId, amount, preferredMethod } = req.body;
 
   try {
-    const { data: invoice, error: invErr } = await supabase
-      .from('invoices')
-      .select('*, tenants(name, email, phone), rooms(number)')
-      .eq('id', invoiceId)
-      .single();
+    let grossAmount = Number(amount) || 1500000;
+    let orderId = `INV-${Date.now().toString().slice(-6)}`;
+    let customerName = 'Penghuni Kost';
+    let customerPhone = '08123456789';
+    let customerEmail = 'penghuni@kost.com';
+    let itemName = 'Sewa Kamar Kost';
 
-    if (invErr || !invoice) return res.status(404).json({ error: 'Invoice not found' });
-    if (invoice.status === 'paid') {
-      return res.status(400).json({ error: 'Tagihan sudah lunas' });
+    if (invoiceId) {
+      const { data: invoice } = await supabase
+        .from('invoices')
+        .select('*, tenants(name, email, phone), rooms(number)')
+        .eq('id', invoiceId)
+        .maybeSingle();
+
+      if (invoice) {
+        if (invoice.status === 'paid') {
+          return res.status(400).json({ error: 'Tagihan sudah lunas' });
+        }
+        grossAmount = Math.round(Number(invoice.amount));
+        orderId = `${invoice.invoice_number}-${Date.now().toString().slice(-4)}`;
+        customerName = invoice.tenants?.name || customerName;
+        customerPhone = invoice.tenants?.phone || customerPhone;
+        customerEmail = invoice.tenants?.email || customerEmail;
+        itemName = `Sewa Kamar ${invoice.rooms?.number || ''} (${invoice.period_month})`;
+      }
+    } else if (tenantId) {
+      const { data: tenant } = await supabase
+        .from('tenants')
+        .select('*, rooms(number, monthly_price)')
+        .eq('id', tenantId)
+        .maybeSingle();
+
+      if (tenant) {
+        customerName = tenant.name || customerName;
+        customerPhone = tenant.phone || customerPhone;
+        customerEmail = tenant.email || customerEmail;
+        grossAmount = Math.round(Number(tenant.rooms?.monthly_price) || grossAmount);
+        orderId = `KST-${tenant.phone?.slice(-4) || 'TEN'}-${Date.now().toString().slice(-5)}`;
+        itemName = `Sewa Kamar ${tenant.rooms?.number || ''}`;
+      }
     }
 
-    const tenant = invoice.tenants;
-    const room = invoice.rooms;
+    // Filter payment methods jika pengguna memilih channel spesifik
+    const enabledPayments: string[] = [];
+    if (preferredMethod === 'qris') {
+      enabledPayments.push('gopay', 'shopeepay', 'other_qris');
+    } else if (preferredMethod === 'briva' || preferredMethod === 'va') {
+      enabledPayments.push('bri_va', 'bca_va', 'bni_va', 'echannel');
+    }
 
-    const parameter = {
+    const parameter: any = {
       transaction_details: {
-        order_id: `${invoice.invoice_number}-${Date.now().toString().slice(-4)}`,
-        gross_amount: Math.round(Number(invoice.amount)),
+        order_id: orderId,
+        gross_amount: grossAmount,
       },
       customer_details: {
-        first_name: tenant?.name || 'Penghuni',
-        email: tenant?.email || 'penghuni@kost.com',
-        phone: tenant?.phone || '08123456789',
+        first_name: customerName,
+        phone: customerPhone,
+        email: customerEmail,
       },
       item_details: [
         {
-          id: invoice.id,
-          price: Math.round(Number(invoice.amount)),
+          id: orderId,
+          price: grossAmount,
           quantity: 1,
-          name: `Sewa Kamar ${room?.number || ''} (${invoice.period_month})`,
+          name: itemName,
         },
       ],
     };
 
+    if (enabledPayments.length > 0) {
+      parameter.enabled_payments = enabledPayments;
+    }
+
     const transaction = await snap.createTransaction(parameter);
 
-    await supabase
-      .from('invoices')
-      .update({
-        snap_token: transaction.token,
-        snap_redirect_url: transaction.redirect_url,
-      })
-      .eq('id', invoiceId);
+    if (invoiceId) {
+      await supabase
+        .from('invoices')
+        .update({
+          snap_token: transaction.token,
+          snap_redirect_url: transaction.redirect_url,
+        })
+        .eq('id', invoiceId);
+    }
 
     res.json({
       token: transaction.token,
       redirect_url: transaction.redirect_url,
+      orderId,
     });
   } catch (err: any) {
     console.error('Midtrans Snap Error:', err);
