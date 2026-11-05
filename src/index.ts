@@ -391,11 +391,38 @@ app.post('/api/tenants/:id/checkout', async (req: Request, res: Response) => {
 });
 
 // Invoices
-app.get('/api/invoices', async (_req: Request, res: Response) => {
+app.get('/api/invoices', async (req: Request, res: Response) => {
   if (!supabase) return res.json([]);
-  const { data, error } = await supabase.from('invoices').select('*').order('created_at', { ascending: false });
+  let query = supabase.from('invoices').select('*, rooms(number, floor, type), tenants(name, phone, email)').order('created_at', { ascending: false });
+  
+  if (req.query.tenantId) {
+    query = query.eq('tenant_id', req.query.tenantId as string);
+  }
+  if (req.query.periodMonth) {
+    query = query.eq('period_month', req.query.periodMonth as string);
+  }
+
+  const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+  
+  // Format field names agar konsisten dengan frontend camelCase
+  const formatted = (data || []).map((inv: any) => ({
+    id: inv.id,
+    invoiceNumber: inv.invoice_number,
+    tenantId: inv.tenant_id,
+    roomId: inv.room_id,
+    periodMonth: inv.period_month,
+    amount: Number(inv.amount),
+    dueDate: inv.due_date,
+    status: inv.status,
+    notes: inv.notes,
+    paidAt: inv.paid_at,
+    createdAt: inv.created_at,
+    room: inv.rooms,
+    tenant: inv.tenants,
+  }));
+
+  res.json(formatted);
 });
 
 app.post('/api/invoices', async (req: Request, res: Response) => {
@@ -485,7 +512,7 @@ app.post('/api/payments/midtrans/create-snap', async (req: Request, res: Respons
     } else if (tenantId) {
       const { data: tenant } = await supabase
         .from('tenants')
-        .select('*, rooms(number, monthly_price)')
+        .select('*, rooms(id, number, monthly_price)')
         .eq('id', tenantId)
         .maybeSingle();
 
@@ -494,8 +521,43 @@ app.post('/api/payments/midtrans/create-snap', async (req: Request, res: Respons
         customerPhone = tenant.phone || customerPhone;
         customerEmail = tenant.email || customerEmail;
         grossAmount = Math.round(Number(tenant.rooms?.monthly_price) || grossAmount);
-        orderId = `KST-${tenant.phone?.slice(-4) || 'TEN'}-${Date.now().toString().slice(-5)}`;
-        itemName = `Sewa Kamar ${tenant.rooms?.number || ''}`;
+        
+        // Cari atau buat tagihan bulan ini agar tersambung ke sistem invoice
+        const currentPeriod = new Date().toISOString().slice(0, 7); // e.g. "2026-11"
+        let { data: currentInvoice } = await supabase
+          .from('invoices')
+          .select('*')
+          .eq('tenant_id', tenant.id)
+          .eq('period_month', currentPeriod)
+          .maybeSingle();
+
+        if (!currentInvoice) {
+          const invNumber = `INV-${currentPeriod.replace('-', '')}-${tenant.phone?.slice(-4) || 'TEN'}`;
+          const { data: newInv } = await supabase
+            .from('invoices')
+            .insert([
+              {
+                invoice_number: invNumber,
+                tenant_id: tenant.id,
+                room_id: tenant.rooms?.id || tenant.room_id,
+                period_month: currentPeriod,
+                amount: grossAmount,
+                due_date: `${currentPeriod}-10`,
+                status: 'unpaid',
+                notes: 'Generated via Portal Penghuni',
+              },
+            ])
+            .select()
+            .single();
+          currentInvoice = newInv;
+        }
+
+        if (currentInvoice) {
+          orderId = `${currentInvoice.invoice_number}-${Date.now().toString().slice(-4)}`;
+        } else {
+          orderId = `KST-${tenant.phone?.slice(-4) || 'TEN'}-${Date.now().toString().slice(-5)}`;
+        }
+        itemName = `Sewa Kamar ${tenant.rooms?.number || ''} (${currentPeriod})`;
       }
     }
 
@@ -692,6 +754,53 @@ app.get('/api/payments/midtrans/status/:orderId', async (req: Request, res: Resp
   }
   try {
     const status = await coreApi.transaction.status(req.params.orderId);
+    
+    // Sinkronkan langsung ke database jika statusnya settlement atau capture
+    if (supabase && (status.transaction_status === 'settlement' || status.transaction_status === 'capture')) {
+      const baseInvNumber = req.params.orderId.split('-').slice(0, 3).join('-');
+      const { data: invoice } = await supabase
+        .from('invoices')
+        .select('*')
+        .or(`invoice_number.eq.${baseInvNumber},invoice_number.eq.${req.params.orderId}`)
+        .maybeSingle();
+
+      if (invoice && invoice.status !== 'paid') {
+        const { data: sub } = await supabase
+          .from('payment_submissions')
+          .upsert(
+            [
+              {
+                invoice_id: invoice.id,
+                tenant_id: invoice.tenant_id,
+                amount: Number(status.gross_amount),
+                payment_date: new Date().toISOString().split('T')[0],
+                method: status.payment_type === 'qris' ? 'midtrans_qris' : 'midtrans_va',
+                payment_gateway: 'midtrans',
+                midtrans_transaction_id: status.transaction_id,
+                midtrans_order_id: req.params.orderId,
+                midtrans_payment_type: status.payment_type,
+                status: 'settlement',
+                raw_response: status,
+                notes: `Auto-verified via polling (${status.payment_type})`,
+              },
+            ],
+            { onConflict: 'midtrans_transaction_id' }
+          )
+          .select()
+          .single();
+
+        await supabase
+          .from('invoices')
+          .update({
+            status: 'paid',
+            paid_at: new Date().toISOString(),
+            latest_submission_id: sub?.id || null,
+          })
+          .eq('id', invoice.id);
+        console.log(`✅ Auto-verified invoice ${invoice.invoice_number} via status polling!`);
+      }
+    }
+
     res.json(status);
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Gagal mengecek status transaksi' });
