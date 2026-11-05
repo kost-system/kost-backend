@@ -1,7 +1,7 @@
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import { supabase, isSupabaseConfigured } from './supabase.js';
-import { snap, isMidtransConfigured, verifyMidtransSignature } from './midtrans.js';
+import { snap, coreApi, isMidtransConfigured, verifyMidtransSignature } from './midtrans.js';
 import {
   Room,
   Tenant,
@@ -509,6 +509,150 @@ app.post('/api/payments/midtrans/create-snap', async (req: Request, res: Respons
   } catch (err: any) {
     console.error('Midtrans Snap Error:', err);
     res.status(500).json({ error: err.message || 'Gagal membuat transaksi Midtrans' });
+  }
+});
+
+/**
+ * 2. CREATE DIRECT QRIS CHARGE (Midtrans Core API)
+ */
+app.post('/api/payments/midtrans/charge-qris', async (req: Request, res: Response) => {
+  if (!isMidtransConfigured || !coreApi) {
+    return res.status(503).json({ error: 'Midtrans belum dikonfigurasi. Periksa kredensial di .env' });
+  }
+  if (!supabase) return res.status(500).json({ error: 'Database offline' });
+
+  const { tenantId, amount, invoiceId } = req.body;
+
+  try {
+    // Cari data tenant & tagihan
+    const { data: tenant } = await supabase.from('tenants').select('*, rooms(number)').eq('id', tenantId).maybeSingle();
+    let grossAmount = Number(amount);
+    let orderId = `QRIS-${Date.now()}`;
+
+    if (invoiceId) {
+      const { data: inv } = await supabase.from('invoices').select('*').eq('id', invoiceId).maybeSingle();
+      if (inv) {
+        grossAmount = Number(inv.amount);
+        orderId = `${inv.invoice_number}-QRIS-${Date.now().toString().slice(-4)}`;
+      }
+    }
+
+    if (!grossAmount || grossAmount <= 0) {
+      grossAmount = 1500000;
+    }
+
+    const parameter = {
+      payment_type: 'qris',
+      transaction_details: {
+        order_id: orderId,
+        gross_amount: Math.round(grossAmount),
+      },
+      qris: {
+        acquirer: 'gopay',
+      },
+      customer_details: {
+        first_name: tenant?.name || 'Penghuni Kost',
+        phone: tenant?.phone || '08123456789',
+        email: tenant?.email || 'penghuni@kost.com',
+      },
+    };
+
+    const chargeResponse = await coreApi.charge(parameter);
+
+    // Ambil URL QR Code dari response Midtrans
+    const qrAction = chargeResponse.actions?.find((a: any) => a.name === 'generate-qr-code');
+    const qrUrl = qrAction?.url || '';
+
+    res.json({
+      orderId: chargeResponse.order_id,
+      transactionId: chargeResponse.transaction_id,
+      grossAmount: chargeResponse.gross_amount,
+      qrString: chargeResponse.qr_string || '',
+      qrUrl,
+      transactionStatus: chargeResponse.transaction_status,
+      expireTime: chargeResponse.expiry_time,
+    });
+  } catch (err: any) {
+    console.error('Midtrans QRIS Charge Error:', err);
+    res.status(500).json({ error: err.message || 'Gagal membuat QRIS Midtrans' });
+  }
+});
+
+/**
+ * 3. CREATE DIRECT BRIVA CHARGE (Midtrans Core API)
+ */
+app.post('/api/payments/midtrans/charge-briva', async (req: Request, res: Response) => {
+  if (!isMidtransConfigured || !coreApi) {
+    return res.status(503).json({ error: 'Midtrans belum dikonfigurasi. Periksa kredensial di .env' });
+  }
+  if (!supabase) return res.status(500).json({ error: 'Database offline' });
+
+  const { tenantId, amount, invoiceId } = req.body;
+
+  try {
+    const { data: tenant } = await supabase.from('tenants').select('*, rooms(number)').eq('id', tenantId).maybeSingle();
+    let grossAmount = Number(amount);
+    let orderId = `BRIVA-${Date.now()}`;
+
+    if (invoiceId) {
+      const { data: inv } = await supabase.from('invoices').select('*').eq('id', invoiceId).maybeSingle();
+      if (inv) {
+        grossAmount = Number(inv.amount);
+        orderId = `${inv.invoice_number}-BRIVA-${Date.now().toString().slice(-4)}`;
+      }
+    }
+
+    if (!grossAmount || grossAmount <= 0) {
+      grossAmount = 1500000;
+    }
+
+    const parameter = {
+      payment_type: 'bank_transfer',
+      bank_transfer: {
+        bank: 'bri',
+      },
+      transaction_details: {
+        order_id: orderId,
+        gross_amount: Math.round(grossAmount),
+      },
+      customer_details: {
+        first_name: tenant?.name || 'Penghuni Kost',
+        phone: tenant?.phone || '08123456789',
+        email: tenant?.email || 'penghuni@kost.com',
+      },
+    };
+
+    const chargeResponse = await coreApi.charge(parameter);
+
+    const vaNumber = chargeResponse.va_numbers?.[0]?.va_number || '';
+
+    res.json({
+      orderId: chargeResponse.order_id,
+      transactionId: chargeResponse.transaction_id,
+      grossAmount: chargeResponse.gross_amount,
+      vaNumber,
+      bank: 'BRI',
+      transactionStatus: chargeResponse.transaction_status,
+      expireTime: chargeResponse.expiry_time,
+    });
+  } catch (err: any) {
+    console.error('Midtrans BRIVA Charge Error:', err);
+    res.status(500).json({ error: err.message || 'Gagal membuat BRIVA Midtrans' });
+  }
+});
+
+/**
+ * 4. CHECK TRANSACTION STATUS (Real-time check)
+ */
+app.get('/api/payments/midtrans/status/:orderId', async (req: Request, res: Response) => {
+  if (!isMidtransConfigured || !coreApi) {
+    return res.status(503).json({ error: 'Midtrans belum dikonfigurasi' });
+  }
+  try {
+    const status = await coreApi.transaction.status(req.params.orderId);
+    res.json(status);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Gagal mengecek status transaksi' });
   }
 });
 
