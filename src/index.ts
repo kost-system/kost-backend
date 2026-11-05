@@ -140,7 +140,14 @@ app.get('/api/bootstrap', async (_req: Request, res: Response) => {
     }
 
     res.json({
-      users: usersRes.data || [],
+      users: (usersRes.data || []).map((u: any) => ({
+        id: u.id,
+        name: u.name,
+        email: u.email,
+        phone: u.phone,
+        role: u.role,
+        avatar: u.avatar,
+      })),
       rooms,
       tenants,
       invoices,
@@ -152,6 +159,126 @@ app.get('/api/bootstrap', async (_req: Request, res: Response) => {
     console.error('Error fetching bootstrap data from Supabase:', err);
     res.status(500).json({ error: err.message });
   }
+});
+
+// ==============================================================================
+// AUTHENTICATION & ADMIN USER MANAGEMENT (OWNER ONLY)
+// ==============================================================================
+
+// 1. Login Admin
+app.post('/api/auth/login', async (req: Request, res: Response) => {
+  if (!supabase) return res.status(500).json({ error: 'Database offline' });
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email dan password wajib diisi' });
+  }
+
+  const { data: user, error } = await supabase
+    .from('users')
+    .select('*')
+    .eq('email', email.trim().toLowerCase())
+    .maybeSingle();
+
+  if (error || !user) {
+    return res.status(401).json({ error: 'Email atau password salah' });
+  }
+
+  // Verifikasi password
+  if (user.password !== password) {
+    return res.status(401).json({ error: 'Email atau password salah' });
+  }
+
+  // Kembalikan profil tanpa password
+  const { password: _, ...userSafe } = user;
+  res.json({
+    user: userSafe,
+    token: `token-${user.id}-${Date.now()}`,
+  });
+});
+
+// 2. Daftar Users Admin (GET /api/users)
+app.get('/api/users', async (_req: Request, res: Response) => {
+  if (!supabase) return res.status(500).json({ error: 'Database offline' });
+  const { data, error } = await supabase
+    .from('users')
+    .select('id, name, email, phone, role, avatar, created_at, updated_at')
+    .order('created_at', { ascending: true });
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// 3. Tambah Admin Baru (POST /api/users) - Digunakan oleh Owner
+app.post('/api/users', async (req: Request, res: Response) => {
+  if (!supabase) return res.status(500).json({ error: 'Database offline' });
+  const { name, email, password, phone, role } = req.body;
+
+  if (!name || !email || !password) {
+    return res.status(400).json({ error: 'Nama, email, dan password wajib diisi' });
+  }
+
+  const cleanEmail = email.trim().toLowerCase();
+  const assignedRole = role === 'owner' ? 'owner' : (role === 'manager' ? 'manager' : 'manager');
+
+  const { data, error } = await supabase
+    .from('users')
+    .insert([
+      {
+        name,
+        email: cleanEmail,
+        password,
+        phone: phone || '',
+        role: assignedRole,
+      },
+    ])
+    .select('id, name, email, phone, role, avatar, created_at')
+    .single();
+
+  if (error) {
+    if (error.code === '23505') {
+      return res.status(400).json({ error: 'Email sudah terdaftar untuk pengguna lain' });
+    }
+    return res.status(500).json({ error: error.message });
+  }
+
+  res.status(201).json(data);
+});
+
+// 4. Update Admin (PUT /api/users/:id) - Ganti password atau peran
+app.put('/api/users/:id', async (req: Request, res: Response) => {
+  if (!supabase) return res.status(500).json({ error: 'Database offline' });
+  const updates: any = {};
+  if (req.body.name !== undefined) updates.name = req.body.name;
+  if (req.body.phone !== undefined) updates.phone = req.body.phone;
+  if (req.body.role !== undefined) updates.role = req.body.role;
+  if (req.body.password) updates.password = req.body.password;
+  updates.updated_at = new Date().toISOString();
+
+  const { data, error } = await supabase
+    .from('users')
+    .update(updates)
+    .eq('id', req.params.id)
+    .select('id, name, email, phone, role, avatar, updated_at')
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// 5. Hapus Admin (DELETE /api/users/:id)
+app.delete('/api/users/:id', async (req: Request, res: Response) => {
+  if (!supabase) return res.status(500).json({ error: 'Database offline' });
+
+  // Cegah menghapus superadmin utama
+  const { data: user } = await supabase.from('users').select('role, email').eq('id', req.params.id).maybeSingle();
+  if (user?.email === 'owner@kost.com') {
+    return res.status(400).json({ error: 'Akun Superadmin Utama tidak dapat dihapus' });
+  }
+
+  const { error } = await supabase.from('users').delete().eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
 });
 
 // SETTINGS (GET & PUT)

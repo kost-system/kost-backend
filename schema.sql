@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name VARCHAR(255) NOT NULL,
     email VARCHAR(255) UNIQUE NOT NULL,
+    password VARCHAR(255),
     phone VARCHAR(50),
     role user_role NOT NULL DEFAULT 'tenant',
     tenant_id UUID,
@@ -264,3 +265,14 @@ DO $$ BEGIN
 EXCEPTION
     WHEN duplicate_object THEN null;
 END $$;
+
+-- ==============================================================================
+-- 9. ADMIN MIGRATION: ADD PASSWORD COLUMN & SEED SUPERADMIN/OWNER
+-- ==============================================================================
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password VARCHAR(255);
+
+-- Tambahkan user default Owner jika belum ada
+INSERT INTO users (name, email, password, phone, role)
+VALUES ('Super Admin / Owner', 'owner@kost.com', 'admin123', '081234567890', 'owner')
+ON CONFLICT (email) DO UPDATE 
+SET password = EXCLUDED.password, role = 'owner';
