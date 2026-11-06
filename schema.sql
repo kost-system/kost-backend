@@ -86,10 +86,14 @@ CREATE TABLE IF NOT EXISTS tenants (
     start_date DATE NOT NULL DEFAULT CURRENT_DATE,
     status tenant_status NOT NULL DEFAULT 'active',
     emergency_contact VARCHAR(100),
+    password VARCHAR(255),
     notes TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Migrasi jika kolom password belum ada di tabel tenants
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS password VARCHAR(255);
 
 -- Foreign keys
 DO $$ BEGIN

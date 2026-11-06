@@ -71,6 +71,7 @@ app.get('/api/bootstrap', async (_req: Request, res: Response) => {
       startDate: t.start_date,
       status: t.status,
       emergencyContact: t.emergency_contact,
+      hasPassword: Boolean(t.password && t.password.trim().length > 0),
       notes: t.notes,
     }));
 
@@ -194,6 +195,210 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
   res.json({
     user: userSafe,
     token: `token-${user.id}-${Date.now()}`,
+  });
+});
+
+// 1b. Autentikasi Tenant / Penghuni Portal
+app.post('/api/auth/tenant-check', async (req: Request, res: Response) => {
+  if (!supabase) return res.status(500).json({ error: 'Database offline' });
+  const { phone } = req.body;
+
+  if (!phone) {
+    return res.status(400).json({ error: 'Nomor telepon wajib diisi' });
+  }
+
+  const cleanPhone = phone.replace(/[^0-9]/g, '');
+
+  // Ambil hanya kolom yang pasti ada agar tidak error jika relasi rooms null atau kolom password baru dibuat
+  const { data: tenants, error } = await supabase
+    .from('tenants')
+    .select('id, name, phone, email, room_id, status, password')
+    .eq('status', 'active');
+
+  if (error || !tenants) {
+    console.error('Error in /api/auth/tenant-check:', error);
+    // Fallback toleran jika kolom password belum ada di Supabase
+    const { data: fallbackTenants, error: fbError } = await supabase
+      .from('tenants')
+      .select('id, name, phone, email, room_id, status')
+      .eq('status', 'active');
+
+    if (fbError || !fallbackTenants) {
+      return res.status(500).json({ error: 'Gagal mengambil data penghuni dari database' });
+    }
+
+    const matchedFb = fallbackTenants.find((t: any) => {
+      const cleanDb = (t.phone || '').replace(/[^0-9]/g, '');
+      return cleanDb === cleanPhone || cleanDb.slice(-8) === cleanPhone.slice(-8);
+    });
+
+    if (!matchedFb) {
+      return res.status(404).json({ error: 'Nomor HP tidak ditemukan dalam daftar penghuni aktif.' });
+    }
+
+    return res.json({
+      tenantId: matchedFb.id,
+      name: matchedFb.name,
+      hasPassword: false,
+    });
+  }
+
+  const matched = tenants.find((t: any) => {
+    const cleanDb = (t.phone || '').replace(/[^0-9]/g, '');
+    return cleanDb === cleanPhone || cleanDb.slice(-8) === cleanPhone.slice(-8);
+  });
+
+  if (!matched) {
+    return res.status(404).json({ error: 'Nomor HP tidak ditemukan dalam daftar penghuni aktif.' });
+  }
+
+  res.json({
+    tenantId: matched.id,
+    name: matched.name,
+    hasPassword: Boolean(matched.password && matched.password.trim().length > 0),
+  });
+});
+
+app.post('/api/auth/tenant-login', async (req: Request, res: Response) => {
+  if (!supabase) return res.status(500).json({ error: 'Database offline' });
+  const { phone, password } = req.body;
+
+  if (!phone || !password) {
+    return res.status(400).json({ error: 'Nomor telepon dan password wajib diisi' });
+  }
+
+  const cleanPhone = phone.replace(/[^0-9]/g, '');
+
+  const { data: tenants, error } = await supabase
+    .from('tenants')
+    .select('id, name, phone, email, room_id, status, password, emergency_contact, start_date')
+    .eq('status', 'active');
+
+  if (error || !tenants) {
+    return res.status(500).json({ error: 'Gagal mengambil data penghuni' });
+  }
+
+  const matched = tenants.find((t: any) => {
+    const cleanDb = (t.phone || '').replace(/[^0-9]/g, '');
+    return cleanDb === cleanPhone || cleanDb.slice(-8) === cleanPhone.slice(-8);
+  });
+
+  if (!matched) {
+    return res.status(404).json({ error: 'Nomor HP tidak ditemukan dalam daftar penghuni aktif.' });
+  }
+
+  // Jika penghuni belum punya password di database, arahkan untuk buat password
+  if (!matched.password || matched.password.trim().length === 0) {
+    return res.status(403).json({
+      error: 'Akun Anda belum memiliki kata sandi. Silakan buat kata sandi terlebih dahulu.',
+      requireSetPassword: true,
+      tenantId: matched.id,
+      name: matched.name,
+    });
+  }
+
+  if (matched.password !== password) {
+    return res.status(401).json({ error: 'Kata sandi / password salah.' });
+  }
+
+  // Ambil data kamar jika ada
+  let assignedRoom = null;
+  if (matched.room_id) {
+    const { data: roomData } = await supabase.from('rooms').select('*').eq('id', matched.room_id).maybeSingle();
+    assignedRoom = roomData;
+  }
+  const sessionData = {
+    id: matched.id,
+    name: matched.name,
+    phone: matched.phone,
+    email: matched.email,
+    roomId: matched.room_id,
+    startDate: matched.start_date,
+    status: matched.status,
+    emergencyContact: matched.emergency_contact,
+    roomNumber: assignedRoom?.number || 'Belum Ditentukan',
+    roomType: assignedRoom?.type || 'Standard',
+    roomFloor: assignedRoom?.floor || 1,
+    monthlyPrice: assignedRoom?.monthly_price || 0,
+  };
+
+  res.json({
+    tenant: sessionData,
+    token: `tenant-${matched.id}-${Date.now()}`,
+  });
+});
+
+app.post('/api/auth/tenant-set-password', async (req: Request, res: Response) => {
+  if (!supabase) return res.status(500).json({ error: 'Database offline' });
+  const { tenantId, phone, password } = req.body;
+
+  if ((!tenantId && !phone) || !password) {
+    return res.status(400).json({ error: 'ID/Nomor telepon dan password baru wajib diisi' });
+  }
+
+  if (password.length < 4) {
+    return res.status(400).json({ error: 'Password minimal 4 karakter' });
+  }
+
+  let targetId = tenantId;
+  if (!targetId && phone) {
+    const cleanPhone = phone.replace(/[^0-9]/g, '');
+    const { data: tenants } = await supabase.from('tenants').select('id, phone').eq('status', 'active');
+    const matched = (tenants || []).find((t: any) => {
+      const cleanDb = (t.phone || '').replace(/[^0-9]/g, '');
+      return cleanDb === cleanPhone || cleanDb.slice(-8) === cleanPhone.slice(-8);
+    });
+    if (!matched) {
+      return res.status(404).json({ error: 'Penghuni tidak ditemukan.' });
+    }
+    targetId = matched.id;
+  }
+
+  const { error } = await supabase
+    .from('tenants')
+    .update({ password, updated_at: new Date().toISOString() })
+    .eq('id', targetId);
+
+  if (error) {
+    return res.status(500).json({ error: error.message });
+  }
+
+  // Ambil data tenant lengkap beserta kamarnya
+  const { data: updatedTenant, error: fetchErr } = await supabase
+    .from('tenants')
+    .select('id, name, phone, email, room_id, status, emergency_contact, start_date')
+    .eq('id', targetId)
+    .single();
+
+  if (fetchErr || !updatedTenant) {
+    return res.status(500).json({ error: 'Gagal memuat profil setelah update password.' });
+  }
+
+  let assignedRoom = null;
+  if (updatedTenant.room_id) {
+    const { data: roomData } = await supabase.from('rooms').select('*').eq('id', updatedTenant.room_id).maybeSingle();
+    assignedRoom = roomData;
+  }
+  const sessionData = {
+    id: updatedTenant.id,
+    name: updatedTenant.name,
+    phone: updatedTenant.phone,
+    email: updatedTenant.email,
+    roomId: updatedTenant.room_id,
+    startDate: updatedTenant.start_date,
+    status: updatedTenant.status,
+    emergencyContact: updatedTenant.emergency_contact,
+    roomNumber: assignedRoom?.number || 'Belum Ditentukan',
+    roomType: assignedRoom?.type || 'Standard',
+    roomFloor: assignedRoom?.floor || 1,
+    monthlyPrice: assignedRoom?.monthly_price || 0,
+  };
+
+  res.json({
+    success: true,
+    message: 'Password berhasil dibuat.',
+    tenant: sessionData,
+    token: `tenant-${updatedTenant.id}-${Date.now()}`,
   });
 });
 
@@ -415,6 +620,7 @@ app.get('/api/tenants', async (_req: Request, res: Response) => {
     startDate: t.start_date,
     status: t.status,
     emergencyContact: t.emergency_contact,
+    hasPassword: Boolean(t.password && t.password.trim().length > 0),
     notes: t.notes,
   }));
   res.json(formatted);
@@ -460,6 +666,7 @@ app.put('/api/tenants/:id', async (req: Request, res: Response) => {
   if (b.startDate !== undefined) updates.start_date = b.startDate;
   if (b.status !== undefined) updates.status = b.status;
   if (b.emergencyContact !== undefined) updates.emergency_contact = b.emergencyContact;
+  if (b.password !== undefined) updates.password = b.password ? b.password : null;
   if (b.notes !== undefined) updates.notes = b.notes;
   updates.updated_at = new Date().toISOString();
 
