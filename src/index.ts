@@ -783,6 +783,84 @@ app.post('/api/invoices', async (req: Request, res: Response) => {
   res.status(201).json(data);
 });
 
+// Batch Generate Invoices Otomatis untuk Semua Penghuni Aktif
+app.post('/api/invoices/batch-generate', async (req: Request, res: Response) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase not connected' });
+  const { periodMonth, dueDay } = req.body;
+
+  if (!periodMonth) {
+    return res.status(400).json({ error: 'Periode tagihan (YYYY-MM) wajib diisi' });
+  }
+
+  // 1. Ambil setting default due day jika tidak dikirim
+  let finalDueDay = dueDay;
+  if (!finalDueDay) {
+    const { data: sData } = await supabase.from('settings').select('default_due_day').limit(1).maybeSingle();
+    finalDueDay = sData?.default_due_day || 10;
+  }
+
+  const dueDate = `${periodMonth}-${String(finalDueDay).padStart(2, '0')}`;
+
+  // 2. Ambil seluruh penghuni aktif beserta detail kamar
+  const { data: activeTenants, error: tenantErr } = await supabase
+    .from('tenants')
+    .select('id, name, room_id')
+    .eq('status', 'active');
+
+  if (tenantErr) return res.status(500).json({ error: tenantErr.message });
+  if (!activeTenants || activeTenants.length === 0) {
+    return res.json({ count: 0, message: 'Tidak ada penghuni aktif yang perlu ditagih.' });
+  }
+
+  // 3. Ambil data kamar untuk harga sewa
+  const roomIds = activeTenants.map((t: any) => t.room_id).filter(Boolean);
+  const { data: roomList } = await supabase.from('rooms').select('id, monthly_price').in('id', roomIds);
+  const roomPriceMap = new Map((roomList || []).map((r: any) => [r.id, Number(r.monthly_price)]));
+
+  // 4. Cek invoice yang SUDAH ada di periode tersebut (mencegah tagihan dobel)
+  const { data: existingInvoices } = await supabase
+    .from('invoices')
+    .select('tenant_id')
+    .eq('period_month', periodMonth);
+
+  const existingTenantSet = new Set((existingInvoices || []).map((i: any) => i.tenant_id));
+
+  // 5. Susun invoice baru
+  const newInvoicesToInsert: any[] = [];
+  let serial = 1;
+  for (const t of activeTenants) {
+    if (!existingTenantSet.has(t.id) && t.room_id) {
+      const price = roomPriceMap.get(t.room_id) || 1500000;
+      const invNum = `INV-${periodMonth.replace('-', '')}-${String(serial).padStart(3, '0')}`;
+      serial++;
+      newInvoicesToInsert.push({
+        invoice_number: invNum,
+        tenant_id: t.id,
+        room_id: t.room_id,
+        period_month: periodMonth,
+        amount: price,
+        due_date: dueDate,
+        status: 'unpaid',
+      });
+    }
+  }
+
+  if (newInvoicesToInsert.length === 0) {
+    return res.json({
+      count: 0,
+      message: `Semua penghuni aktif sudah memiliki tagihan untuk periode ${periodMonth}.`,
+    });
+  }
+
+  const { error: insertErr } = await supabase.from('invoices').insert(newInvoicesToInsert);
+  if (insertErr) return res.status(500).json({ error: insertErr.message });
+
+  res.json({
+    count: newInvoicesToInsert.length,
+    message: `Berhasil membuat ${newInvoicesToInsert.length} tagihan sewa baru untuk periode ${periodMonth}.`,
+  });
+});
+
 app.put('/api/invoices/:id', async (req: Request, res: Response) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase not connected' });
   const { data, error } = await supabase
