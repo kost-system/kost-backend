@@ -762,6 +762,28 @@ app.get('/api/invoices', async (req: Request, res: Response) => {
 app.post('/api/invoices', async (req: Request, res: Response) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase not connected' });
   const { tenantId, roomId, periodMonth, amount, dueDate, notes, invoiceNumber } = req.body;
+
+  let calculatedDueDate = dueDate;
+  if (!calculatedDueDate && tenantId && periodMonth) {
+    const { data: tenantData } = await supabase.from('tenants').select('start_date').eq('id', tenantId).maybeSingle();
+    let dueDay = 10;
+    if (tenantData?.start_date) {
+      const parts = tenantData.start_date.split('-');
+      if (parts.length === 3) {
+        dueDay = parseInt(parts[2], 10) || 10;
+      }
+    } else {
+      const { data: sData } = await supabase.from('settings').select('default_due_day').limit(1).maybeSingle();
+      dueDay = sData?.default_due_day || 10;
+    }
+    const [yearStr, monthStr] = periodMonth.split('-');
+    const year = parseInt(yearStr, 10);
+    const month = parseInt(monthStr, 10);
+    const maxDays = new Date(year, month, 0).getDate();
+    const finalDay = Math.min(dueDay, maxDays);
+    calculatedDueDate = `${periodMonth}-${String(finalDay).padStart(2, '0')}`;
+  }
+
   const { data, error } = await supabase
     .from('invoices')
     .insert([
@@ -771,7 +793,7 @@ app.post('/api/invoices', async (req: Request, res: Response) => {
         room_id: roomId,
         period_month: periodMonth,
         amount: Number(amount),
-        due_date: dueDate,
+        due_date: calculatedDueDate,
         status: 'unpaid',
         notes,
       },
@@ -792,19 +814,17 @@ app.post('/api/invoices/batch-generate', async (req: Request, res: Response) => 
     return res.status(400).json({ error: 'Periode tagihan (YYYY-MM) wajib diisi' });
   }
 
-  // 1. Ambil setting default due day jika tidak dikirim
-  let finalDueDay = dueDay;
-  if (!finalDueDay) {
+  // 1. Ambil setting default due day sebagai fallback
+  let defaultDueDay = dueDay;
+  if (!defaultDueDay) {
     const { data: sData } = await supabase.from('settings').select('default_due_day').limit(1).maybeSingle();
-    finalDueDay = sData?.default_due_day || 10;
+    defaultDueDay = sData?.default_due_day || 10;
   }
 
-  const dueDate = `${periodMonth}-${String(finalDueDay).padStart(2, '0')}`;
-
-  // 2. Ambil seluruh penghuni aktif beserta detail kamar
+  // 2. Ambil seluruh penghuni aktif beserta tanggal mulai sewa (start_date)
   const { data: activeTenants, error: tenantErr } = await supabase
     .from('tenants')
-    .select('id, name, room_id')
+    .select('id, name, room_id, start_date')
     .eq('status', 'active');
 
   if (tenantErr) return res.status(500).json({ error: tenantErr.message });
@@ -825,7 +845,13 @@ app.post('/api/invoices/batch-generate', async (req: Request, res: Response) => 
 
   const existingTenantSet = new Set((existingInvoices || []).map((i: any) => i.tenant_id));
 
-  // 5. Susun invoice baru
+  // 5. Hitung batas hari dalam bulan periode (misal Feb: 28/29, April: 30)
+  const [yearStr, monthStr] = periodMonth.split('-');
+  const year = parseInt(yearStr, 10);
+  const month = parseInt(monthStr, 10);
+  const maxDaysInMonth = new Date(year, month, 0).getDate();
+
+  // 6. Susun invoice baru dengan jatuh tempo dinamis mengikuti start_date tiap penghuni
   const newInvoicesToInsert: any[] = [];
   let serial = 1;
   for (const t of activeTenants) {
@@ -833,6 +859,19 @@ app.post('/api/invoices/batch-generate', async (req: Request, res: Response) => 
       const price = roomPriceMap.get(t.room_id) || 1500000;
       const invNum = `INV-${periodMonth.replace('-', '')}-${String(serial).padStart(3, '0')}`;
       serial++;
+
+      let tenantDueDay = defaultDueDay;
+      if (t.start_date) {
+        const parts = t.start_date.split('-');
+        if (parts.length === 3) {
+          tenantDueDay = parseInt(parts[2], 10) || defaultDueDay;
+        }
+      }
+
+      // Pastikan tanggal tidak melebihi jumlah hari di bulan tersebut
+      const clampedDueDay = Math.min(tenantDueDay, maxDaysInMonth);
+      const dueDate = `${periodMonth}-${String(clampedDueDay).padStart(2, '0')}`;
+
       newInvoicesToInsert.push({
         invoice_number: invNum,
         tenant_id: t.id,
