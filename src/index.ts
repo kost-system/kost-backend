@@ -12,6 +12,7 @@ import {
   User,
 } from './types.js';
 import { sendWhatsAppMessage, formatIndoDate, formatRentalPeriod } from './services/whatsappService.js';
+import { generateReceiptImageBase64 } from './services/receiptImageService.js';
 import cron from 'node-cron';
 
 const app = express();
@@ -1503,22 +1504,44 @@ app.post('/api/payments/midtrans/notification', async (req: Request, res: Respon
           ? await supabase.from('rooms').select('number').eq('id', invoice.room_id).maybeSingle()
           : { data: null };
 
-        const { data: settingsData } = await supabase.from('settings').select('phone, default_due_day').limit(1).maybeSingle();
+        const { data: settingsData } = await supabase.from('settings').select('kost_name, phone, default_due_day').limit(1).maybeSingle();
+        const kostName = settingsData?.kost_name || 'Kost Management';
         const adminPhone = settingsData?.phone || process.env.ADMIN_WHATSAPP_NUMBER || '';
 
+        const tenantName = tenantData?.name || 'Penghuni Kost';
+        const tenantPhone = tenantData?.phone || '';
+        const roomNumber = roomData?.number ? `No. ${roomData.number}` : '-';
+        
+        let startDay = settingsData?.default_due_day || 10;
+        if (tenantData?.start_date) {
+          const parts = tenantData.start_date.split('-');
+          if (parts.length === 3) startDay = parseInt(parts[2], 10) || startDay;
+        }
+
+        const periodFormatted = formatRentalPeriod(invoice.period_month, startDay);
+        const nominalFormatted = new Intl.NumberFormat('id-ID').format(Number(gross_amount));
+        const paymentDateStr = formatIndoDate(new Date().toISOString());
+
+        // GENERATE GAMBAR RESI KWITANSI DIGITAL RESMI
+        let receiptImageBase64 = '';
+        try {
+          receiptImageBase64 = await generateReceiptImageBase64({
+            kostName,
+            invoiceNumber: invoice.invoice_number,
+            tenantName,
+            roomNumber,
+            rentalPeriod: periodFormatted,
+            amount: Number(gross_amount),
+            paymentMethod: `Midtrans (${payment_type.toUpperCase()})`,
+            paymentDate: paymentDateStr,
+            transactionId: transaction_id,
+          });
+        } catch (imgErr: any) {
+          console.warn('[Receipt Image Warning] Gagal render gambar resi:', imgErr.message);
+        }
+
+        // 1. Kirim Foto Resi + Laporan Pembayaran ke WhatsApp Admin
         if (adminPhone) {
-          const tenantName = tenantData?.name || 'Penghuni Kost';
-          const roomNumber = roomData?.number ? `No. ${roomData.number}` : '-';
-          
-          let startDay = settingsData?.default_due_day || 10;
-          if (tenantData?.start_date) {
-            const parts = tenantData.start_date.split('-');
-            if (parts.length === 3) startDay = parseInt(parts[2], 10) || startDay;
-          }
-
-          const periodFormatted = formatRentalPeriod(invoice.period_month, startDay);
-          const nominalFormatted = new Intl.NumberFormat('id-ID').format(Number(gross_amount));
-
           const adminMsg = `*PEMBAYARAN KOST DITERIMA* 💰\n\n` +
             `• Dari: *${tenantName}*\n` +
             `• Kamar: *${roomNumber}*\n` +
@@ -1526,12 +1549,32 @@ app.post('/api/payments/midtrans/notification', async (req: Request, res: Respon
             `• Nominal: *Rp ${nominalFormatted}*\n` +
             `• Metode: *Midtrans (${payment_type.toUpperCase()})*\n` +
             `• Waktu: *${new Date().toLocaleString('id-ID')}*\n\n` +
-            `Status tagihan otomatis berubah menjadi *LUNAS*.`;
+            `Status tagihan otomatis diverifikasi *LUNAS*. Bukti resi terlampir di atas.`;
 
-          await sendWhatsAppMessage({ phone: adminPhone, message: adminMsg });
+          await sendWhatsAppMessage({
+            phone: adminPhone,
+            message: adminMsg,
+            imageBase64: receiptImageBase64,
+            imageFileName: `Resi_${invoice.invoice_number}.png`,
+          });
+        }
+
+        // 2. Kirim Foto Resi + Bukti Pelunasan ke WhatsApp Penyewa
+        if (tenantPhone) {
+          const tenantMsg = `Halo Kak *${tenantName}* 👋\n\n` +
+            `Pembayaran sewa kamar *${roomNumber}* periode *${periodFormatted}* sebesar *Rp ${nominalFormatted}* telah *KAMI TERIMA & DIVERIFIKASI LUNAS* ✅\n\n` +
+            `Bukti resi kwitansi digital Anda terlampir pada gambar di atas.\n` +
+            `Terima kasih telah melakukan pembayaran tepat waktu! 🙏`;
+
+          await sendWhatsAppMessage({
+            phone: tenantPhone,
+            message: tenantMsg,
+            imageBase64: receiptImageBase64,
+            imageFileName: `Kwitansi_${invoice.invoice_number}.png`,
+          });
         }
       } catch (waErr: any) {
-        console.error('Gagal mengirim WA notifikasi pembayaran ke Admin:', waErr.message);
+        console.error('Gagal memproses WA notifikasi pembayaran:', waErr.message);
       }
     }
 

@@ -5,6 +5,8 @@ dotenv.config();
 export interface SendWhatsAppParams {
   phone: string;
   message: string;
+  imageBase64?: string;
+  imageFileName?: string;
 }
 
 const WA_BOT_URL = process.env.WA_BOT_URL || 'http://localhost:5001';
@@ -12,14 +14,10 @@ const WA_BOT_SECRET = process.env.WA_BOT_SECRET || 'kost_secret_wa_bot_key_2026'
 const WA_GATEWAY_TOKEN = process.env.WA_GATEWAY_TOKEN || ''; // Fonnte token jika ada
 
 /**
- * Helper fleksibel untuk mengirim WhatsApp
- * Mendukung:
- * 1. Bot Baileys/WhatsApp-Web internal (POST ke WA_BOT_URL)
- * 2. Gateway Fonnte jika WA_GATEWAY_TOKEN diisi
- * 3. Fallback console log jika bot sedang offline (mencegah server crash)
+ * Helper fleksibel untuk mengirim WhatsApp (Teks atau Gambar Resi Media)
  */
-export async function sendWhatsAppMessage({ phone, message }: SendWhatsAppParams): Promise<boolean> {
-  if (!phone || !message) return false;
+export async function sendWhatsAppMessage({ phone, message, imageBase64, imageFileName }: SendWhatsAppParams): Promise<boolean> {
+  if (!phone || (!message && !imageBase64)) return false;
 
   const cleanedPhone = phone.replace(/[^0-9]/g, '');
   if (!cleanedPhone) return false;
@@ -57,7 +55,12 @@ export async function sendWhatsAppMessage({ phone, message }: SendWhatsAppParams
         'Content-Type': 'application/json',
         Authorization: `Bearer ${WA_BOT_SECRET}`,
       },
-      body: JSON.stringify({ phone: cleanedPhone, message }),
+      body: JSON.stringify({
+        phone: cleanedPhone,
+        message,
+        imageBase64,
+        imageFileName,
+      }),
       signal: controller.signal,
     });
     clearTimeout(timeout);
