@@ -12,6 +12,7 @@ import {
   User,
 } from './types.js';
 import { sendWhatsAppMessage, formatIndoDate, formatRentalPeriod } from './services/whatsappService.js';
+import cron from 'node-cron';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -901,85 +902,91 @@ app.post('/api/invoices/batch-generate', async (req: Request, res: Response) => 
   });
 });
 
-// PENGINGAT TAGIHAN H-3 (Dapat dipicu otomatis via cron harian atau tombol admin)
+// HELPER INTI PENGIRIM PENGINGAT JATUH TEMPO (Digunakan endpoint & Cron Job)
+async function triggerDueReminders(daysAhead: number): Promise<{ count: number; successCount: number; results: any[] }> {
+  if (!supabase) return { count: 0, successCount: 0, results: [] };
+
+  const targetDate = new Date();
+  targetDate.setDate(targetDate.getDate() + daysAhead);
+  const targetDateStr = targetDate.toISOString().split('T')[0];
+
+  const { data: invoices, error } = await supabase
+    .from('invoices')
+    .select('*, rooms(number), tenants(name, phone, start_date)')
+    .eq('status', 'unpaid')
+    .eq('due_date', targetDateStr);
+
+  if (error || !invoices || invoices.length === 0) {
+    return { count: 0, successCount: 0, results: [] };
+  }
+
+  const { data: settingsData } = await supabase.from('settings').select('kost_name, default_due_day').limit(1).maybeSingle();
+  const kostName = settingsData?.kost_name || 'Kost';
+
+  let successCount = 0;
+  const results: any[] = [];
+
+  for (const inv of invoices) {
+    const tenant = inv.tenants;
+    const room = inv.rooms;
+    const tenantPhone = tenant?.phone;
+
+    if (!tenantPhone) {
+      results.push({ invoiceNumber: inv.invoice_number, status: 'skipped', reason: 'No phone' });
+      continue;
+    }
+
+    let startDay = settingsData?.default_due_day || 10;
+    if (tenant?.start_date) {
+      const parts = tenant.start_date.split('-');
+      if (parts.length === 3) startDay = parseInt(parts[2], 10) || startDay;
+    }
+
+    const periodFormatted = formatRentalPeriod(inv.period_month, startDay);
+    const nominalFormatted = new Intl.NumberFormat('id-ID').format(Number(inv.amount));
+    const dueFormatted = formatIndoDate(inv.due_date);
+
+    const reminderMsg =
+      `Halo Kak *${tenant.name || 'Penghuni'}* 👋\n\n` +
+      `Ini adalah pesan pengingat tagihan dari *${kostName}*.\n` +
+      `Tagihan sewa kamar *No. ${room?.number || '-'}* periode *${periodFormatted}* sebesar *Rp ${nominalFormatted}* akan jatuh tempo pada *${dueFormatted}* (${daysAhead} hari lagi).\n\n` +
+      `Silakan lakukan pembayaran tepat waktu melalui portal penghuni kost atau hubungi pengelola jika ada pertanyaan.\n\n` +
+      `Terima kasih 🙏`;
+
+    const sent = await sendWhatsAppMessage({ phone: tenantPhone, message: reminderMsg });
+    if (sent) successCount++;
+
+    results.push({
+      invoiceNumber: inv.invoice_number,
+      tenant: tenant.name,
+      phone: tenantPhone,
+      status: sent ? 'sent' : 'failed_or_logged',
+    });
+  }
+
+  return {
+    count: invoices.length,
+    successCount,
+    results,
+  };
+}
+
+// PENGINGAT TAGIHAN (Dapat dipicu otomatis via cron harian atau tombol admin)
 app.post('/api/invoices/send-due-reminders', async (req: Request, res: Response) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase not connected' });
 
   try {
-    // 1. Tentukan target tanggal jatuh tempo (H-3 dari hari ini)
-    const targetDate = new Date();
-    targetDate.setDate(targetDate.getDate() + 3);
-    const targetDateStr = targetDate.toISOString().split('T')[0]; // Format YYYY-MM-DD
-
-    // 2. Ambil invoice yang unpaid dan jatuh tempo tepat H-3 (atau custom target dueDate dari body)
-    const filterDueDate = req.body.dueDate || targetDateStr;
-
-    const { data: invoices, error } = await supabase
-      .from('invoices')
-      .select('*, rooms(number), tenants(name, phone, start_date)')
-      .eq('status', 'unpaid')
-      .eq('due_date', filterDueDate);
-
-    if (error) return res.status(500).json({ error: error.message });
-    if (!invoices || invoices.length === 0) {
-      return res.json({
-        count: 0,
-        message: `Tidak ada tagihan yang jatuh tempo H-3 (pada tanggal ${filterDueDate}).`,
-      });
-    }
-
-    const { data: settingsData } = await supabase.from('settings').select('kost_name, default_due_day').limit(1).maybeSingle();
-    const kostName = settingsData?.kost_name || 'Kost';
-
-    let successCount = 0;
-    const results: any[] = [];
-
-    for (const inv of invoices) {
-      const tenant = inv.tenants;
-      const room = inv.rooms;
-      const tenantPhone = tenant?.phone;
-
-      if (!tenantPhone) {
-        results.push({ invoiceNumber: inv.invoice_number, status: 'skipped', reason: 'No phone number' });
-        continue;
-      }
-
-      let startDay = settingsData?.default_due_day || 10;
-      if (tenant?.start_date) {
-        const parts = tenant.start_date.split('-');
-        if (parts.length === 3) startDay = parseInt(parts[2], 10) || startDay;
-      }
-
-      const periodFormatted = formatRentalPeriod(inv.period_month, startDay);
-      const nominalFormatted = new Intl.NumberFormat('id-ID').format(Number(inv.amount));
-      const dueFormatted = formatIndoDate(inv.due_date);
-
-      const reminderMsg =
-        `Halo Kak *${tenant.name || 'Penghuni'}* 👋\n\n` +
-        `Ini adalah pesan pengingat dari *${kostName}*.\n` +
-        `Tagihan sewa kamar *No. ${room?.number || '-'}* periode *${periodFormatted}* sebesar *Rp ${nominalFormatted}* akan jatuh tempo pada *${dueFormatted}* (3 hari lagi).\n\n` +
-        `Silakan lakukan pembayaran tepat waktu melalui portal penghuni kost atau hubungi pengelola kost jika ada pertanyaan.\n\n` +
-        `Terima kasih 🙏`;
-
-      const sent = await sendWhatsAppMessage({ phone: tenantPhone, message: reminderMsg });
-      if (sent) successCount++;
-
-      results.push({
-        invoiceNumber: inv.invoice_number,
-        tenant: tenant.name,
-        phone: tenantPhone,
-        status: sent ? 'sent' : 'failed_or_logged',
-      });
-    }
+    const days = Number(req.body.daysAhead) || 3;
+    const result = await triggerDueReminders(days);
 
     res.json({
-      targetDueDate: filterDueDate,
-      totalFound: invoices.length,
-      successCount,
-      results,
+      daysAhead: days,
+      totalFound: result.count,
+      successCount: result.successCount,
+      results: result.results,
     });
   } catch (err: any) {
-    console.error('Error saat kirim pengingat tagihan H-3:', err);
+    console.error('Error saat kirim pengingat tagihan:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1569,4 +1576,20 @@ app.listen(PORT, () => {
   console.log(`🚀 Kost Backend API running on http://localhost:${PORT}`);
   console.log(`📡 Database mode: ${isSupabaseConfigured ? 'Supabase Live' : 'Offline / Mock'}`);
   console.log(`💳 Midtrans Gateway: ${isMidtransConfigured ? 'Configured & Active' : 'Waiting for Keys'}`);
+
+  // CRON JOB: Otomatis jalankan pengingat setiap pukul 09:00 pagi WIB (Asia/Jakarta)
+  // Menargetkan tagihan jatuh tempo H-3 dan H-2
+  cron.schedule('0 9 * * *', async () => {
+    console.log('[Cron Job] Menjalankan pengingat otomatis jatuh tempo tagihan H-3 & H-2...');
+    try {
+      const h3 = await triggerDueReminders(3);
+      const h2 = await triggerDueReminders(2);
+      console.log(`[Cron Job Selesai] H-3: ${h3.successCount}/${h3.count} terkirim. H-2: ${h2.successCount}/${h2.count} terkirim.`);
+    } catch (e: any) {
+      console.error('[Cron Job Error] Gagal menjalankan pengingat otomatis:', e.message);
+    }
+  }, {
+    timezone: 'Asia/Jakarta',
+  });
+  console.log('⏰ Cron Job aktif: Pengingat tagihan H-3 & H-2 dijadwalkan setiap 09:00 WIB');
 });
