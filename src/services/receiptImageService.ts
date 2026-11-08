@@ -1,4 +1,4 @@
-import PImage from 'pureimage';
+import * as PImage from 'pureimage';
 import { Writable } from 'stream';
 
 export interface ReceiptData {
