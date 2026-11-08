@@ -11,6 +11,7 @@ import {
   KostSettings,
   User,
 } from './types.js';
+import { sendWhatsAppMessage, formatIndoDate, formatRentalPeriod } from './services/whatsappService.js';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -900,6 +901,148 @@ app.post('/api/invoices/batch-generate', async (req: Request, res: Response) => 
   });
 });
 
+// PENGINGAT TAGIHAN H-3 (Dapat dipicu otomatis via cron harian atau tombol admin)
+app.post('/api/invoices/send-due-reminders', async (req: Request, res: Response) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase not connected' });
+
+  try {
+    // 1. Tentukan target tanggal jatuh tempo (H-3 dari hari ini)
+    const targetDate = new Date();
+    targetDate.setDate(targetDate.getDate() + 3);
+    const targetDateStr = targetDate.toISOString().split('T')[0]; // Format YYYY-MM-DD
+
+    // 2. Ambil invoice yang unpaid dan jatuh tempo tepat H-3 (atau custom target dueDate dari body)
+    const filterDueDate = req.body.dueDate || targetDateStr;
+
+    const { data: invoices, error } = await supabase
+      .from('invoices')
+      .select('*, rooms(number), tenants(name, phone, start_date)')
+      .eq('status', 'unpaid')
+      .eq('due_date', filterDueDate);
+
+    if (error) return res.status(500).json({ error: error.message });
+    if (!invoices || invoices.length === 0) {
+      return res.json({
+        count: 0,
+        message: `Tidak ada tagihan yang jatuh tempo H-3 (pada tanggal ${filterDueDate}).`,
+      });
+    }
+
+    const { data: settingsData } = await supabase.from('settings').select('kost_name, default_due_day').limit(1).maybeSingle();
+    const kostName = settingsData?.kost_name || 'Kost';
+
+    let successCount = 0;
+    const results: any[] = [];
+
+    for (const inv of invoices) {
+      const tenant = inv.tenants;
+      const room = inv.rooms;
+      const tenantPhone = tenant?.phone;
+
+      if (!tenantPhone) {
+        results.push({ invoiceNumber: inv.invoice_number, status: 'skipped', reason: 'No phone number' });
+        continue;
+      }
+
+      let startDay = settingsData?.default_due_day || 10;
+      if (tenant?.start_date) {
+        const parts = tenant.start_date.split('-');
+        if (parts.length === 3) startDay = parseInt(parts[2], 10) || startDay;
+      }
+
+      const periodFormatted = formatRentalPeriod(inv.period_month, startDay);
+      const nominalFormatted = new Intl.NumberFormat('id-ID').format(Number(inv.amount));
+      const dueFormatted = formatIndoDate(inv.due_date);
+
+      const reminderMsg =
+        `Halo Kak *${tenant.name || 'Penghuni'}* 👋\n\n` +
+        `Ini adalah pesan pengingat dari *${kostName}*.\n` +
+        `Tagihan sewa kamar *No. ${room?.number || '-'}* periode *${periodFormatted}* sebesar *Rp ${nominalFormatted}* akan jatuh tempo pada *${dueFormatted}* (3 hari lagi).\n\n` +
+        `Silakan lakukan pembayaran tepat waktu melalui portal penghuni kost atau hubungi pengelola kost jika ada pertanyaan.\n\n` +
+        `Terima kasih 🙏`;
+
+      const sent = await sendWhatsAppMessage({ phone: tenantPhone, message: reminderMsg });
+      if (sent) successCount++;
+
+      results.push({
+        invoiceNumber: inv.invoice_number,
+        tenant: tenant.name,
+        phone: tenantPhone,
+        status: sent ? 'sent' : 'failed_or_logged',
+      });
+    }
+
+    res.json({
+      targetDueDate: filterDueDate,
+      totalFound: invoices.length,
+      successCount,
+      results,
+    });
+  } catch (err: any) {
+    console.error('Error saat kirim pengingat tagihan H-3:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// KIRIM PENGINGAT WA INDIVIDUAL PER INVOICE (Manual Trigger dari Dashboard)
+app.post('/api/invoices/:id/send-reminder', async (req: Request, res: Response) => {
+  if (!supabase) return res.status(500).json({ error: 'Supabase not connected' });
+
+  try {
+    const { id } = req.params;
+    const { data: inv, error } = await supabase
+      .from('invoices')
+      .select('*, rooms(number), tenants(name, phone, start_date)')
+      .eq('id', id)
+      .single();
+
+    if (error || !inv) {
+      return res.status(404).json({ error: 'Invoice tidak ditemukan' });
+    }
+
+    const tenant = inv.tenants;
+    const room = inv.rooms;
+    const tenantPhone = tenant?.phone;
+
+    if (!tenantPhone) {
+      return res.status(400).json({ error: 'Penghuni tidak memiliki nomor WhatsApp/HP' });
+    }
+
+    const { data: settingsData } = await supabase.from('settings').select('kost_name, default_due_day').limit(1).maybeSingle();
+    const kostName = settingsData?.kost_name || 'Kost';
+
+    let startDay = settingsData?.default_due_day || 10;
+    if (tenant?.start_date) {
+      const parts = tenant.start_date.split('-');
+      if (parts.length === 3) startDay = parseInt(parts[2], 10) || startDay;
+    }
+
+    const periodFormatted = formatRentalPeriod(inv.period_month, startDay);
+    const nominalFormatted = new Intl.NumberFormat('id-ID').format(Number(inv.amount));
+    const dueFormatted = formatIndoDate(inv.due_date);
+
+    const reminderMsg =
+      `Halo Kak *${tenant.name || 'Penghuni'}* 👋\n\n` +
+      `Ini adalah pesan pengingat tagihan dari *${kostName}*.\n` +
+      `Tagihan sewa kamar *No. ${room?.number || '-'}* periode *${periodFormatted}* sebesar *Rp ${nominalFormatted}* memiliki jatuh tempo pada *${dueFormatted}*.\n\n` +
+      `Silakan lakukan pembayaran melalui portal penghuni kost atau hubungi pengelola jika memerlukan bantuan.\n\n` +
+      `Terima kasih 🙏`;
+
+    const sent = await sendWhatsAppMessage({ phone: tenantPhone, message: reminderMsg });
+
+    res.json({
+      success: true,
+      sent,
+      message: sent
+        ? `Pengingat WhatsApp berhasil dikirim ke ${tenant.name} (${tenantPhone})`
+        : `Pengingat dicatat di sistem (bot WA offline / tersimpan di log)`,
+    });
+  } catch (err: any) {
+    console.error('Error saat kirim pengingat per invoice:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.put('/api/invoices/:id', async (req: Request, res: Response) => {
   if (!supabase) return res.status(500).json({ error: 'Supabase not connected' });
   const { data, error } = await supabase
@@ -1340,6 +1483,49 @@ app.post('/api/payments/midtrans/notification', async (req: Request, res: Respon
         })
         .eq('id', invoice.id);
       console.log(`✅ Invoice ${invoice.invoice_number} successfully paid via Midtrans!`);
+
+      // NOTIFIKASI OTOMATIS KE WHATSAPP ADMIN
+      try {
+        const { data: tenantData } = await supabase
+          .from('tenants')
+          .select('name, phone, room_id, start_date')
+          .eq('id', invoice.tenant_id)
+          .maybeSingle();
+
+        const { data: roomData } = invoice.room_id
+          ? await supabase.from('rooms').select('number').eq('id', invoice.room_id).maybeSingle()
+          : { data: null };
+
+        const { data: settingsData } = await supabase.from('settings').select('phone, default_due_day').limit(1).maybeSingle();
+        const adminPhone = settingsData?.phone || process.env.ADMIN_WHATSAPP_NUMBER || '';
+
+        if (adminPhone) {
+          const tenantName = tenantData?.name || 'Penghuni Kost';
+          const roomNumber = roomData?.number ? `No. ${roomData.number}` : '-';
+          
+          let startDay = settingsData?.default_due_day || 10;
+          if (tenantData?.start_date) {
+            const parts = tenantData.start_date.split('-');
+            if (parts.length === 3) startDay = parseInt(parts[2], 10) || startDay;
+          }
+
+          const periodFormatted = formatRentalPeriod(invoice.period_month, startDay);
+          const nominalFormatted = new Intl.NumberFormat('id-ID').format(Number(gross_amount));
+
+          const adminMsg = `*PEMBAYARAN KOST DITERIMA* 💰\n\n` +
+            `• Dari: *${tenantName}*\n` +
+            `• Kamar: *${roomNumber}*\n` +
+            `• Periode Sewa: *${periodFormatted}*\n` +
+            `• Nominal: *Rp ${nominalFormatted}*\n` +
+            `• Metode: *Midtrans (${payment_type.toUpperCase()})*\n` +
+            `• Waktu: *${new Date().toLocaleString('id-ID')}*\n\n` +
+            `Status tagihan otomatis berubah menjadi *LUNAS*.`;
+
+          await sendWhatsAppMessage({ phone: adminPhone, message: adminMsg });
+        }
+      } catch (waErr: any) {
+        console.error('Gagal mengirim WA notifikasi pembayaran ke Admin:', waErr.message);
+      }
     }
 
     res.status(200).json({ status: 'ok' });
