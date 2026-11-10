@@ -757,6 +757,74 @@ app.post('/api/tenants/:id/checkout', async (req: Request, res: Response) => {
 // Invoices
 app.get('/api/invoices', async (req: Request, res: Response) => {
   if (!supabase) return res.json([]);
+
+  // AUTO-GENERATE TAGIHAN H-5 JATUH TEMPO
+  // Jika penghuni membuka portal / get invoices, otomatis pastikan tagihan bulan ini sudah dibuatkan jika sudah masuk H-5 jatuh tempo
+  if (req.query.tenantId) {
+    try {
+      const tenantId = req.query.tenantId as string;
+      const { data: tenant } = await supabase
+        .from('tenants')
+        .select('*, rooms(id, number, monthly_price)')
+        .eq('id', tenantId)
+        .eq('status', 'active')
+        .maybeSingle();
+
+      if (tenant && tenant.room_id) {
+        const { data: sData } = await supabase.from('settings').select('default_due_day').limit(1).maybeSingle();
+        let dueDay = sData?.default_due_day || 10;
+        if (tenant.start_date) {
+          const parts = tenant.start_date.split('-');
+          if (parts.length === 3) dueDay = parseInt(parts[2], 10) || dueDay;
+        }
+
+        const now = new Date();
+        const year = now.getFullYear();
+        const month = now.getMonth() + 1; // 1-12
+        const currentPeriod = `${year}-${String(month).padStart(2, '0')}`;
+        const maxDays = new Date(year, month, 0).getDate();
+        const actualDueDay = Math.min(dueDay, maxDays);
+        const dueDate = new Date(year, month - 1, actualDueDay);
+
+        // Hitung selisih hari: jika sekarang >= (dueDate - 5 hari)
+        const fiveDaysBeforeDue = new Date(dueDate);
+        fiveDaysBeforeDue.setDate(fiveDaysBeforeDue.getDate() - 5);
+
+        if (now >= fiveDaysBeforeDue) {
+          // Periksa apakah invoice periode ini sudah ada
+          const { data: existingInv } = await supabase
+            .from('invoices')
+            .select('id')
+            .eq('tenant_id', tenantId)
+            .eq('period_month', currentPeriod)
+            .maybeSingle();
+
+          if (!existingInv) {
+            const dueDateStr = `${currentPeriod}-${String(actualDueDay).padStart(2, '0')}`;
+            const invNumber = `INV-${currentPeriod.replace('-', '')}-${tenant.phone?.slice(-4) || String(actualDueDay).padStart(2, '0')}`;
+            const amount = Number(tenant.rooms?.monthly_price) || 1500000;
+
+            await supabase.from('invoices').insert([
+              {
+                invoice_number: invNumber,
+                tenant_id: tenantId,
+                room_id: tenant.room_id,
+                period_month: currentPeriod,
+                amount,
+                due_date: dueDateStr,
+                status: 'unpaid',
+                notes: 'Otomatis diterbitkan H-5 sebelum jatuh tempo',
+              },
+            ]);
+            console.log(`[Auto-Billing H-5] Berhasil menerbitkan invoice ${invNumber} untuk ${tenant.name}`);
+          }
+        }
+      }
+    } catch (autoErr: any) {
+      console.warn('[Auto-Billing Warning] Gagal cek H-5:', autoErr.message);
+    }
+  }
+
   let query = supabase.from('invoices').select('*, rooms(number, floor, type), tenants(name, phone, email)').order('created_at', { ascending: false });
   
   if (req.query.tenantId) {
