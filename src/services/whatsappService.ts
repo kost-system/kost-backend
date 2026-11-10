@@ -9,8 +9,8 @@ export interface SendWhatsAppParams {
   imageFileName?: string;
 }
 
-const WA_BOT_URL = process.env.WA_BOT_URL || 'http://localhost:5001';
-const WA_BOT_SECRET = process.env.WA_BOT_SECRET || 'kost_secret_wa_bot_key_2026';
+const WA_BOT_URL = process.env.WA_BOT_URL || '';
+const WA_BOT_SECRET = process.env.WA_BOT_SECRET || '';
 const FONNTE_TOKEN = process.env.FONNTE_TOKEN || process.env.WA_GATEWAY_TOKEN || '';
 
 /**
