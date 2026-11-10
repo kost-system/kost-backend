@@ -1151,14 +1151,27 @@ app.post('/api/payments/midtrans/create-snap', async (req: Request, res: Respons
         customerEmail = tenant.email || customerEmail;
         grossAmount = Math.round(Number(tenant.rooms?.monthly_price) || grossAmount);
         
-        // Cari atau buat tagihan bulan ini agar tersambung ke sistem invoice
+        // Cari tagihan yang belum dibayar untuk tenant ini
         const currentPeriod = new Date().toISOString().slice(0, 7); // e.g. "2026-11"
         let { data: currentInvoice } = await supabase
           .from('invoices')
           .select('*')
           .eq('tenant_id', tenant.id)
-          .eq('period_month', currentPeriod)
+          .eq('status', 'unpaid')
+          .order('created_at', { ascending: false })
+          .limit(1)
           .maybeSingle();
+
+        // Jika tidak ada tagihan unpaid, cari yang bulan berjalan
+        if (!currentInvoice) {
+          const { data: monthInv } = await supabase
+            .from('invoices')
+            .select('*')
+            .eq('tenant_id', tenant.id)
+            .eq('period_month', currentPeriod)
+            .maybeSingle();
+          currentInvoice = monthInv;
+        }
 
         if (!currentInvoice) {
           const invNumber = `INV-${currentPeriod.replace('-', '')}-${tenant.phone?.slice(-4) || 'TEN'}`;
@@ -1183,8 +1196,9 @@ app.post('/api/payments/midtrans/create-snap', async (req: Request, res: Respons
 
         if (currentInvoice) {
           orderId = `${currentInvoice.invoice_number}-${Date.now().toString().slice(-4)}`;
+          grossAmount = Number(currentInvoice.amount) || grossAmount;
         } else {
-          orderId = `KST-${tenant.phone?.slice(-4) || 'TEN'}-${Date.now().toString().slice(-5)}`;
+          orderId = `INV-${Date.now().toString().slice(-6)}`;
         }
         itemName = `Sewa Kamar ${tenant.rooms?.number || ''} (${currentPeriod})`;
       }
