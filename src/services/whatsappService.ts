@@ -11,7 +11,7 @@ export interface SendWhatsAppParams {
 
 const WA_BOT_URL = process.env.WA_BOT_URL || 'http://localhost:5001';
 const WA_BOT_SECRET = process.env.WA_BOT_SECRET || 'kost_secret_wa_bot_key_2026';
-const WA_GATEWAY_TOKEN = process.env.WA_GATEWAY_TOKEN || ''; // Fonnte token jika ada
+const FONNTE_TOKEN = process.env.FONNTE_TOKEN || process.env.WA_GATEWAY_TOKEN || '';
 
 /**
  * Helper fleksibel untuk mengirim WhatsApp (Teks atau Gambar Resi Media)
@@ -22,23 +22,39 @@ export async function sendWhatsAppMessage({ phone, message, imageBase64, imageFi
   const cleanedPhone = phone.replace(/[^0-9]/g, '');
   if (!cleanedPhone) return false;
 
-  // 1. Jika pengguna mengatur Fonnte Token di .env
-  if (WA_GATEWAY_TOKEN) {
+  // 1. Jika pengguna mengatur Fonnte Token (Prioritas Utama - Serverless Friendly)
+  if (FONNTE_TOKEN) {
     try {
+      const payload: any = {
+        target: cleanedPhone,
+        message: message || '',
+      };
+
+      // Jika ada lampiran gambar resi kwitansi
+      if (imageBase64) {
+        // Fonnte menerima data URL base64 atau url file
+        payload.url = imageBase64.startsWith('data:') 
+          ? imageBase64 
+          : `data:image/png;base64,${imageBase64}`;
+        if (imageFileName) {
+          payload.filename = imageFileName;
+        }
+      }
+
       const response = await fetch('https://api.fonnte.com/send', {
         method: 'POST',
         headers: {
-          Authorization: WA_GATEWAY_TOKEN,
+          Authorization: FONNTE_TOKEN,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          target: cleanedPhone,
-          message: message,
-        }),
+        body: JSON.stringify(payload),
       });
-      const data = await response.json();
+
+      const data: any = await response.json();
       console.log(`[Fonnte WA] Kirim ke ${cleanedPhone}:`, data);
-      return Boolean(data?.status);
+      if (data && (data.status === true || data.status === 'true')) {
+        return true;
+      }
     } catch (err: any) {
       console.error(`[Fonnte Error] Gagal kirim ke ${cleanedPhone}:`, err.message);
     }
