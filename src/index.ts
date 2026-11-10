@@ -1375,15 +1375,161 @@ app.post('/api/payments/midtrans/charge-briva', async (req: Request, res: Respon
 });
 
 /**
+ * Helper terpusat untuk memproses pelunasan invoice & mengirimkan kwitansi WA
+ */
+async function processSuccessfulPayment(invoice: any, paymentDetails: {
+  grossAmount: number;
+  paymentType: string;
+  transactionId: string;
+  orderId: string;
+  source: string;
+}) {
+  if (!supabase || invoice.status === 'paid') return;
+
+  const { grossAmount, paymentType, transactionId, orderId, source } = paymentDetails;
+
+  // 1. Simpan bukti submission
+  const { data: sub } = await supabase
+    .from('payment_submissions')
+    .upsert(
+      [
+        {
+          invoice_id: invoice.id,
+          tenant_id: invoice.tenant_id,
+          amount: Number(grossAmount),
+          payment_date: new Date().toISOString().split('T')[0],
+          method: paymentType === 'qris' ? 'midtrans_qris' : 'midtrans_va',
+          payment_gateway: 'midtrans',
+          midtrans_transaction_id: transactionId,
+          midtrans_order_id: orderId,
+          midtrans_payment_type: paymentType,
+          status: 'settlement',
+          notes: `Auto-verified via ${source} (${paymentType})`,
+        },
+      ],
+      { onConflict: 'midtrans_transaction_id' }
+    )
+    .select()
+    .single();
+
+  // 2. Update status invoice ke 'paid'
+  await supabase
+    .from('invoices')
+    .update({
+      status: 'paid',
+      paid_at: new Date().toISOString(),
+      latest_submission_id: sub?.id || null,
+    })
+    .eq('id', invoice.id);
+
+  console.log(`✅ Invoice ${invoice.invoice_number} successfully verified LUNAS via ${source}!`);
+
+  // 3. Kirim notifikasi WA & Resi Kwitansi via Fonnte
+  try {
+    const { data: tenantData } = await supabase
+      .from('tenants')
+      .select('name, phone, room_id, start_date')
+      .eq('id', invoice.tenant_id)
+      .maybeSingle();
+
+    const { data: roomData } = invoice.room_id
+      ? await supabase.from('rooms').select('number').eq('id', invoice.room_id).maybeSingle()
+      : { data: null };
+
+    const { data: settingsData } = await supabase.from('settings').select('kost_name, phone, default_due_day').limit(1).maybeSingle();
+    const kostName = settingsData?.kost_name || 'Kost Management';
+    const adminPhone = settingsData?.phone || process.env.ADMIN_WHATSAPP_NUMBER || '';
+
+    const tenantName = tenantData?.name || 'Penghuni Kost';
+    const tenantPhone = tenantData?.phone || '';
+    const roomNumber = roomData?.number ? `No. ${roomData.number}` : '-';
+
+    let startDay = settingsData?.default_due_day || 10;
+    if (tenantData?.start_date) {
+      const parts = tenantData.start_date.split('-');
+      if (parts.length === 3) startDay = parseInt(parts[2], 10) || startDay;
+    }
+
+    const periodFormatted = formatRentalPeriod(invoice.period_month, startDay);
+    const nominalFormatted = new Intl.NumberFormat('id-ID').format(Number(grossAmount));
+    const paymentDateStr = formatIndoDate(new Date().toISOString());
+
+    // Generate Resi Gambar LUNAS
+    let receiptImageBase64 = '';
+    try {
+      receiptImageBase64 = await generateReceiptImageBase64({
+        kostName,
+        invoiceNumber: invoice.invoice_number,
+        tenantName,
+        roomNumber,
+        rentalPeriod: periodFormatted,
+        amount: Number(grossAmount),
+        paymentMethod: `Midtrans (${paymentType.toUpperCase()})`,
+        paymentDate: paymentDateStr,
+        transactionId: transactionId || orderId,
+      });
+    } catch (imgErr: any) {
+      console.warn('[Receipt Image Warning] Gagal render gambar resi:', imgErr.message);
+    }
+
+    // A. Kirim ke WhatsApp Admin/Owner
+    if (adminPhone) {
+      const adminMsg = `*PEMBAYARAN KOST DITERIMA* 💰\n\n` +
+        `• Dari: *${tenantName}*\n` +
+        `• Kamar: *${roomNumber}*\n` +
+        `• Periode Sewa: *${periodFormatted}*\n` +
+        `• Nominal: *Rp ${nominalFormatted}*\n` +
+        `• Metode: *Midtrans (${paymentType.toUpperCase()})*\n` +
+        `• Waktu: *${new Date().toLocaleString('id-ID')}*\n\n` +
+        `Status tagihan otomatis diverifikasi *LUNAS*. Bukti resi terlampir di atas.`;
+
+      await sendWhatsAppMessage({
+        phone: adminPhone,
+        message: adminMsg,
+        imageBase64: receiptImageBase64,
+        imageFileName: `Resi_${invoice.invoice_number}.png`,
+      });
+    }
+
+    // B. Kirim ke WhatsApp Penyewa
+    if (tenantPhone) {
+      const tenantMsg = `Halo Kak *${tenantName}* 👋\n\n` +
+        `Pembayaran sewa kamar *${roomNumber}* periode *${periodFormatted}* sebesar *Rp ${nominalFormatted}* telah *KAMI TERIMA & DIVERIFIKASI LUNAS* ✅\n\n` +
+        `Bukti resi kwitansi digital Anda terlampir pada gambar di atas.\n` +
+        `Terima kasih telah melakukan pembayaran tepat waktu! 🙏`;
+
+      await sendWhatsAppMessage({
+        phone: tenantPhone,
+        message: tenantMsg,
+        imageBase64: receiptImageBase64,
+        imageFileName: `Kwitansi_${invoice.invoice_number}.png`,
+      });
+    }
+  } catch (waErr: any) {
+    console.error('Gagal mengirim notifikasi WA:', waErr.message);
+  }
+}
+
+/**
  * 4. CHECK TRANSACTION STATUS (Real-time check)
  */
 app.get('/api/payments/midtrans/status/:orderId', async (req: Request, res: Response) => {
   if (!isMidtransConfigured || !coreApi) {
     return res.status(503).json({ error: 'Midtrans belum dikonfigurasi' });
   }
+
   try {
-    const status = await coreApi.transaction.status(req.params.orderId);
-    
+    let status: any;
+    try {
+      status = await coreApi.transaction.status(req.params.orderId);
+    } catch (statusErr: any) {
+      // Jika Midtrans mengembalikan 404 (transaksi belum terbentuk), jangan crash 500
+      return res.status(200).json({
+        transaction_status: 'pending',
+        message: 'Transaksi belum diselesaikan atau sedang diproses.',
+      });
+    }
+
     // Sinkronkan langsung ke database jika statusnya settlement atau capture
     if (supabase && (status.transaction_status === 'settlement' || status.transaction_status === 'capture')) {
       const baseInvNumber = req.params.orderId.split('-').slice(0, 3).join('-');
@@ -1394,51 +1540,29 @@ app.get('/api/payments/midtrans/status/:orderId', async (req: Request, res: Resp
         .maybeSingle();
 
       if (invoice && invoice.status !== 'paid') {
-        const { data: sub } = await supabase
-          .from('payment_submissions')
-          .upsert(
-            [
-              {
-                invoice_id: invoice.id,
-                tenant_id: invoice.tenant_id,
-                amount: Number(status.gross_amount),
-                payment_date: new Date().toISOString().split('T')[0],
-                method: status.payment_type === 'qris' ? 'midtrans_qris' : 'midtrans_va',
-                payment_gateway: 'midtrans',
-                midtrans_transaction_id: status.transaction_id,
-                midtrans_order_id: req.params.orderId,
-                midtrans_payment_type: status.payment_type,
-                status: 'settlement',
-                raw_response: status,
-                notes: `Auto-verified via polling (${status.payment_type})`,
-              },
-            ],
-            { onConflict: 'midtrans_transaction_id' }
-          )
-          .select()
-          .single();
-
-        await supabase
-          .from('invoices')
-          .update({
-            status: 'paid',
-            paid_at: new Date().toISOString(),
-            latest_submission_id: sub?.id || null,
-          })
-          .eq('id', invoice.id);
-        console.log(`✅ Auto-verified invoice ${invoice.invoice_number} via status polling!`);
+        await processSuccessfulPayment(invoice, {
+          grossAmount: Number(status.gross_amount),
+          paymentType: status.payment_type || 'midtrans',
+          transactionId: status.transaction_id,
+          orderId: req.params.orderId,
+          source: 'polling',
+        });
       }
     }
 
     res.json(status);
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Gagal mengecek status transaksi' });
+    console.error('Status check error:', err.message);
+    res.status(200).json({ transaction_status: 'pending' });
   }
 });
 
+/**
+ * 5. MIDTRANS WEBHOOK NOTIFICATION (Always returns HTTP 200 OK)
+ */
 app.post('/api/payments/midtrans/notification', async (req: Request, res: Response) => {
   const notification = req.body;
-  if (!supabase) return res.status(500).json({ error: 'Database offline' });
+  if (!supabase) return res.status(200).json({ status: 'ok', note: 'db offline' });
 
   const {
     order_id,
@@ -1451,167 +1575,43 @@ app.post('/api/payments/midtrans/notification', async (req: Request, res: Respon
     fraud_status,
   } = notification;
 
+  // Verifikasi signature
   const isValid = verifyMidtransSignature(order_id, status_code, gross_amount, signature_key);
   if (!isValid) {
     console.warn(`🚨 Invalid Midtrans Signature for order: ${order_id}`);
-    return res.status(403).json({ error: 'Invalid signature key' });
+    // Tetap kembalikan 200 agar Midtrans tidak retry terus-menerus
+    return res.status(200).json({ status: 'rejected', error: 'Invalid signature key' });
   }
 
   try {
-    // Cari invoice baik berdasarkan nomor asli atau order_id
-    const { data: matchedInvoices } = await supabase
-      .from('invoices')
-      .select('*');
-
-    const invoice = (matchedInvoices || []).find((inv: any) => 
-      inv.invoice_number === order_id || 
-      order_id.startsWith(inv.invoice_number)
+    const { data: matchedInvoices } = await supabase.from('invoices').select('*');
+    const invoice = (matchedInvoices || []).find((inv: any) =>
+      inv.invoice_number === order_id || order_id.startsWith(inv.invoice_number)
     );
 
     if (!invoice) {
       console.warn(`Invoice not found for order ${order_id}`);
-      return res.status(404).json({ error: 'Invoice not found' });
+      return res.status(200).json({ status: 'ok', note: 'Invoice not found' });
     }
 
-    if (invoice.status === 'paid') {
-      return res.status(200).json({ message: 'Transaction already settled' });
+    const isSuccess =
+      transaction_status === 'settlement' ||
+      (transaction_status === 'capture' && fraud_status === 'accept');
+
+    if (isSuccess && invoice.status !== 'paid') {
+      await processSuccessfulPayment(invoice, {
+        grossAmount: Number(gross_amount),
+        paymentType: payment_type || 'qris',
+        transactionId: transaction_id,
+        orderId: order_id,
+        source: 'webhook',
+      });
     }
 
-    let isSuccess = false;
-
-    if (transaction_status === 'capture') {
-      if (fraud_status === 'accept') {
-        isSuccess = true;
-      }
-    } else if (transaction_status === 'settlement') {
-      isSuccess = true;
-    }
-
-    const { data: submission } = await supabase
-      .from('payment_submissions')
-      .upsert(
-        [
-          {
-            invoice_id: invoice.id,
-            tenant_id: invoice.tenant_id,
-            amount: Number(gross_amount),
-            payment_date: new Date().toISOString().split('T')[0],
-            method: payment_type === 'qris' ? 'midtrans_qris' : 'midtrans_va',
-            payment_gateway: 'midtrans',
-            midtrans_transaction_id: transaction_id,
-            midtrans_order_id: order_id,
-            midtrans_payment_type: payment_type,
-            status: isSuccess ? 'settlement' : 'pending',
-            raw_response: notification,
-            notes: `Midtrans payment via ${payment_type} (${transaction_status})`,
-          },
-        ],
-        { onConflict: 'midtrans_transaction_id' }
-      )
-      .select()
-      .single();
-
-    if (isSuccess) {
-      await supabase
-        .from('invoices')
-        .update({
-          status: 'paid',
-          paid_at: new Date().toISOString(),
-          latest_submission_id: submission?.id || null,
-        })
-        .eq('id', invoice.id);
-      console.log(`✅ Invoice ${invoice.invoice_number} successfully paid via Midtrans!`);
-
-      // NOTIFIKASI OTOMATIS KE WHATSAPP ADMIN
-      try {
-        const { data: tenantData } = await supabase
-          .from('tenants')
-          .select('name, phone, room_id, start_date')
-          .eq('id', invoice.tenant_id)
-          .maybeSingle();
-
-        const { data: roomData } = invoice.room_id
-          ? await supabase.from('rooms').select('number').eq('id', invoice.room_id).maybeSingle()
-          : { data: null };
-
-        const { data: settingsData } = await supabase.from('settings').select('kost_name, phone, default_due_day').limit(1).maybeSingle();
-        const kostName = settingsData?.kost_name || 'Kost Management';
-        const adminPhone = settingsData?.phone || process.env.ADMIN_WHATSAPP_NUMBER || '';
-
-        const tenantName = tenantData?.name || 'Penghuni Kost';
-        const tenantPhone = tenantData?.phone || '';
-        const roomNumber = roomData?.number ? `No. ${roomData.number}` : '-';
-        
-        let startDay = settingsData?.default_due_day || 10;
-        if (tenantData?.start_date) {
-          const parts = tenantData.start_date.split('-');
-          if (parts.length === 3) startDay = parseInt(parts[2], 10) || startDay;
-        }
-
-        const periodFormatted = formatRentalPeriod(invoice.period_month, startDay);
-        const nominalFormatted = new Intl.NumberFormat('id-ID').format(Number(gross_amount));
-        const paymentDateStr = formatIndoDate(new Date().toISOString());
-
-        // GENERATE GAMBAR RESI KWITANSI DIGITAL RESMI
-        let receiptImageBase64 = '';
-        try {
-          receiptImageBase64 = await generateReceiptImageBase64({
-            kostName,
-            invoiceNumber: invoice.invoice_number,
-            tenantName,
-            roomNumber,
-            rentalPeriod: periodFormatted,
-            amount: Number(gross_amount),
-            paymentMethod: `Midtrans (${payment_type.toUpperCase()})`,
-            paymentDate: paymentDateStr,
-            transactionId: transaction_id,
-          });
-        } catch (imgErr: any) {
-          console.warn('[Receipt Image Warning] Gagal render gambar resi:', imgErr.message);
-        }
-
-        // 1. Kirim Foto Resi + Laporan Pembayaran ke WhatsApp Admin
-        if (adminPhone) {
-          const adminMsg = `*PEMBAYARAN KOST DITERIMA* 💰\n\n` +
-            `• Dari: *${tenantName}*\n` +
-            `• Kamar: *${roomNumber}*\n` +
-            `• Periode Sewa: *${periodFormatted}*\n` +
-            `• Nominal: *Rp ${nominalFormatted}*\n` +
-            `• Metode: *Midtrans (${payment_type.toUpperCase()})*\n` +
-            `• Waktu: *${new Date().toLocaleString('id-ID')}*\n\n` +
-            `Status tagihan otomatis diverifikasi *LUNAS*. Bukti resi terlampir di atas.`;
-
-          await sendWhatsAppMessage({
-            phone: adminPhone,
-            message: adminMsg,
-            imageBase64: receiptImageBase64,
-            imageFileName: `Resi_${invoice.invoice_number}.png`,
-          });
-        }
-
-        // 2. Kirim Foto Resi + Bukti Pelunasan ke WhatsApp Penyewa
-        if (tenantPhone) {
-          const tenantMsg = `Halo Kak *${tenantName}* 👋\n\n` +
-            `Pembayaran sewa kamar *${roomNumber}* periode *${periodFormatted}* sebesar *Rp ${nominalFormatted}* telah *KAMI TERIMA & DIVERIFIKASI LUNAS* ✅\n\n` +
-            `Bukti resi kwitansi digital Anda terlampir pada gambar di atas.\n` +
-            `Terima kasih telah melakukan pembayaran tepat waktu! 🙏`;
-
-          await sendWhatsAppMessage({
-            phone: tenantPhone,
-            message: tenantMsg,
-            imageBase64: receiptImageBase64,
-            imageFileName: `Kwitansi_${invoice.invoice_number}.png`,
-          });
-        }
-      } catch (waErr: any) {
-        console.error('Gagal memproses WA notifikasi pembayaran:', waErr.message);
-      }
-    }
-
-    res.status(200).json({ status: 'ok' });
+    return res.status(200).json({ status: 'ok' });
   } catch (err: any) {
     console.error('Error handling Midtrans webhook:', err);
-    res.status(500).json({ error: err.message });
+    return res.status(200).json({ status: 'ok', error: err.message });
   }
 });
 
