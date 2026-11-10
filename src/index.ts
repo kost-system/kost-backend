@@ -18,7 +18,34 @@ import cron from 'node-cron';
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-app.use(cors());
+// CORS protection: izinkan frontend terdaftar, localhost, dan mobile/server-to-server (origin null/undefined)
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'http://localhost:5173',
+  process.env.FRONTEND_DASHBOARD_URL,
+  process.env.FRONTEND_LANDING_URL,
+].filter(Boolean) as string[];
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Izinkan webhook Midtrans, server-to-server fetch, atau tool seperti Postman yang tidak mengirim origin header
+      if (!origin) return callback(null, true);
+
+      // Izinkan origin jika cocok atau match subdomain Vercel milik project
+      const isAllowed =
+        allowedOrigins.includes(origin) ||
+        origin.endsWith('.vercel.app');
+
+      if (isAllowed) {
+        return callback(null, true);
+      }
+      return callback(new Error(`CORS blocked: Origin ${origin} not allowed`));
+    },
+    credentials: true,
+  })
+);
 app.use(express.json({ limit: '10mb' }));
 
 // Health check
