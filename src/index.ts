@@ -682,6 +682,49 @@ app.post('/api/tenants', async (req: Request, res: Response) => {
     await supabase.from('rooms').update({ status: 'occupied', current_tenant_id: data.id }).eq('id', roomId);
   }
 
+  // AUTO-GENERATE TAGIHAN PERTAMA / H-5: Saat tambah penghuni baru, langsung terbitkan invoice
+  try {
+    const sDate = startDate || new Date().toISOString().split('T')[0];
+    const parts = sDate.split('-');
+    let dueDay = 10;
+    if (parts.length === 3) dueDay = parseInt(parts[2], 10) || 10;
+
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = now.getMonth() + 1;
+    const currentPeriod = `${year}-${String(month).padStart(2, '0')}`;
+    const maxDays = new Date(year, month, 0).getDate();
+    const actualDueDay = Math.min(dueDay, maxDays);
+    const dueDate = new Date(year, month - 1, actualDueDay);
+
+    const fiveDaysBefore = new Date(dueDate);
+    fiveDaysBefore.setDate(fiveDaysBefore.getDate() - 5);
+
+    // Jika hari ini sudah masuk rentang H-5 sebelum tanggal jatuh tempo sewa, buatkan tagihan langsung
+    if (now >= fiveDaysBefore && roomId) {
+      const { data: roomInfo } = await supabase.from('rooms').select('monthly_price').eq('id', roomId).maybeSingle();
+      const dueDateStr = `${currentPeriod}-${String(actualDueDay).padStart(2, '0')}`;
+      const invNumber = `INV-${currentPeriod.replace('-', '')}-${(phone || '0000').slice(-4)}`;
+      const amount = Number(roomInfo?.monthly_price) || 1500000;
+
+      await supabase.from('invoices').insert([
+        {
+          invoice_number: invNumber,
+          tenant_id: data.id,
+          room_id: roomId,
+          period_month: currentPeriod,
+          amount,
+          due_date: dueDateStr,
+          status: 'unpaid',
+          notes: 'Tagihan sewa perdana penghuni baru',
+        },
+      ]);
+      console.log(`[Auto-Billing New Tenant] Menerbitkan invoice perdana ${invNumber} untuk ${name}`);
+    }
+  } catch (newTenantErr: any) {
+    console.warn('[Auto-Billing New Tenant Error]:', newTenantErr.message);
+  }
+
   res.status(201).json(data);
 });
 
