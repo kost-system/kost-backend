@@ -1431,12 +1431,15 @@ app.post('/api/payments/midtrans/notification', async (req: Request, res: Respon
   }
 
   try {
-    const baseInvNumber = order_id.split('-').slice(0, 3).join('-');
-    const { data: invoice } = await supabase
+    // Cari invoice baik berdasarkan nomor asli atau order_id
+    const { data: matchedInvoices } = await supabase
       .from('invoices')
-      .select('*')
-      .or(`invoice_number.eq.${baseInvNumber},invoice_number.eq.${order_id}`)
-      .single();
+      .select('*');
+
+    const invoice = (matchedInvoices || []).find((inv: any) => 
+      inv.invoice_number === order_id || 
+      order_id.startsWith(inv.invoice_number)
+    );
 
     if (!invoice) {
       console.warn(`Invoice not found for order ${order_id}`);
@@ -1615,24 +1618,30 @@ app.post('/api/expenses', async (req: Request, res: Response) => {
   res.status(201).json(data);
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Kost Backend API running on http://localhost:${PORT}`);
-  console.log(`📡 Database mode: ${isSupabaseConfigured ? 'Supabase Live' : 'Offline / Mock'}`);
-  console.log(`💳 Midtrans Gateway: ${isMidtransConfigured ? 'Configured & Active' : 'Waiting for Keys'}`);
+// Export app instance untuk Vercel Serverless / Testing
+export default app;
 
-  // CRON JOB: Otomatis jalankan pengingat setiap pukul 09:00 pagi WIB (Asia/Jakarta)
-  // Menargetkan tagihan jatuh tempo H-3 dan H-2
-  cron.schedule('0 9 * * *', async () => {
-    console.log('[Cron Job] Menjalankan pengingat otomatis jatuh tempo tagihan H-3 & H-2...');
-    try {
-      const h3 = await triggerDueReminders(3);
-      const h2 = await triggerDueReminders(2);
-      console.log(`[Cron Job Selesai] H-3: ${h3.successCount}/${h3.count} terkirim. H-2: ${h2.successCount}/${h2.count} terkirim.`);
-    } catch (e: any) {
-      console.error('[Cron Job Error] Gagal menjalankan pengingat otomatis:', e.message);
-    }
-  }, {
-    timezone: 'Asia/Jakarta',
+// Jalankan server jika dijalankan secara mandiri (local / container), bukan di-import oleh serverless handler
+if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`🚀 Kost Backend API running on http://localhost:${PORT}`);
+    console.log(`📡 Database mode: ${isSupabaseConfigured ? 'Supabase Live' : 'Offline / Mock'}`);
+    console.log(`💳 Midtrans Gateway: ${isMidtransConfigured ? 'Configured & Active' : 'Waiting for Keys'}`);
+
+    // CRON JOB: Otomatis jalankan pengingat setiap pukul 09:00 pagi WIB (Asia/Jakarta)
+    // Menargetkan tagihan jatuh tempo H-3 dan H-2
+    cron.schedule('0 9 * * *', async () => {
+      console.log('[Cron Job] Menjalankan pengingat otomatis jatuh tempo tagihan H-3 & H-2...');
+      try {
+        const h3 = await triggerDueReminders(3);
+        const h2 = await triggerDueReminders(2);
+        console.log(`[Cron Job Selesai] H-3: ${h3.successCount}/${h3.count} terkirim. H-2: ${h2.successCount}/${h2.count} terkirim.`);
+      } catch (e: any) {
+        console.error('[Cron Job Error] Gagal menjalankan pengingat otomatis:', e.message);
+      }
+    }, {
+      timezone: 'Asia/Jakarta',
+    });
+    console.log('⏰ Cron Job aktif: Pengingat tagihan H-3 & H-2 dijadwalkan setiap 09:00 WIB');
   });
-  console.log('⏰ Cron Job aktif: Pengingat tagihan H-3 & H-2 dijadwalkan setiap 09:00 WIB');
-});
+}
