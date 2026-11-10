@@ -722,6 +722,63 @@ app.put('/api/tenants/:id', async (req: Request, res: Response) => {
     }
   }
 
+  // SINKRONISASI OTOMATIS TAGIHAN H-5: Jika startDate diubah, periksa & terbitkan/update tagihan
+  if (b.startDate !== undefined) {
+    try {
+      const parts = b.startDate.split('-');
+      if (parts.length === 3) {
+        const dueDay = parseInt(parts[2], 10) || 10;
+        const now = new Date();
+        const year = now.getFullYear();
+        const month = now.getMonth() + 1;
+        const currentPeriod = `${year}-${String(month).padStart(2, '0')}`;
+        const maxDays = new Date(year, month, 0).getDate();
+        const actualDueDay = Math.min(dueDay, maxDays);
+        const dueDate = new Date(year, month - 1, actualDueDay);
+
+        const fiveDaysBefore = new Date(dueDate);
+        fiveDaysBefore.setDate(fiveDaysBefore.getDate() - 5);
+
+        // Jika hari ini sudah masuk rentang H-5 sebelum tanggal jatuh tempo baru
+        if (now >= fiveDaysBefore) {
+          const { data: existInv } = await supabase
+            .from('invoices')
+            .select('*')
+            .eq('tenant_id', req.params.id)
+            .eq('period_month', currentPeriod)
+            .maybeSingle();
+
+          const dueDateStr = `${currentPeriod}-${String(actualDueDay).padStart(2, '0')}`;
+          if (!existInv) {
+            const { data: roomInfo } = await supabase.from('rooms').select('monthly_price').eq('id', data.room_id).maybeSingle();
+            const invNumber = `INV-${currentPeriod.replace('-', '')}-${(data.phone || '0000').slice(-4)}`;
+            await supabase.from('invoices').insert([
+              {
+                invoice_number: invNumber,
+                tenant_id: req.params.id,
+                room_id: data.room_id,
+                period_month: currentPeriod,
+                amount: Number(roomInfo?.monthly_price) || 1500000,
+                due_date: dueDateStr,
+                status: 'unpaid',
+                notes: 'Otomatis diterbitkan sesuai tanggal sewa penghuni (H-5)',
+              },
+            ]);
+            console.log(`[Auto-Billing Update] Menerbitkan invoice ${invNumber} untuk ${data.name}`);
+          } else if (existInv.status === 'unpaid') {
+            // Update due_date tagihan yang belum dibayar agar sinkron dengan tanggal sewa baru
+            await supabase
+              .from('invoices')
+              .update({ due_date: dueDateStr })
+              .eq('id', existInv.id);
+          }
+        }
+      }
+    } catch (syncErr: any) {
+      console.warn('[Auto-Billing Sync Error]:', syncErr.message);
+    }
+  }
+
   res.json(data);
 });
 
